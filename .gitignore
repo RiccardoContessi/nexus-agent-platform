@@ -6,3 +6,7 @@
 models.comments.py
 database.comments.py
 auth.comments.py
+
+# Non carico pdf:
+scripts/docs/hr/*
+scripts/docs/ml/*
