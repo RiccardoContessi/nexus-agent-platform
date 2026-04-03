@@ -1,23 +1,6 @@
 # =============================================================================
 # models.py — Modelli ORM (traduce da python a sql) e Pydantic schemas
 # =============================================================================
-# Questo file ha due sezioni distinte con scopi diversi:
-#
-# SEZIONE 1 — ORM Models (SQLAlchemy)
-#   Mappano le classi Python sulle tabelle PostgreSQL.
-#   Usati internamente per leggere/scrivere dati nel DB.
-#   Non vengono mai esposti direttamente via API.
-#
-# SEZIONE 2 — Pydantic Schemas
-#   Definiscono la forma dei dati in entrata (request) e uscita (response)
-#   dall'API REST. FastAPI li usa per validare e serializzare automaticamente.
-#   Separati dagli ORM perché l'API non espone mai tutto ciò che c'è nel DB
-#   (es: hashed_password non deve mai uscire in una response).
-#
-# Relazioni tra tabelle:
-#   User 1──>n Conversation 1──>n Message
-#   (un utente ha molte conversazioni, ogni conversazione ha molti messaggi)
-# =============================================================================
 
 import uuid
 from datetime import datetime

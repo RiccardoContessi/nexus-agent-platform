@@ -1,2 +1,7 @@
 
 .env
+
+
+# file miei commentati
+models.comments.py
+database.comments.py
