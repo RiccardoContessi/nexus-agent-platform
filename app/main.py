@@ -43,7 +43,7 @@ from app.auth import (
 from app.memory import save_to_db, load_from_db
 from app.mcp_server import start_mcp_server, write_event_direct
 from app.supervisor import build_supervisor
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
 settings = get_settings()
 
