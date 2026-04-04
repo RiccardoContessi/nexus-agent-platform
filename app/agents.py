@@ -20,6 +20,14 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
+from typing import Annotated
+from typing_extensions import TypedDict
+from langgraph.graph.message import add_messages
+
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]  # accumula invece di sovrascrivere
+    summary : str
+
 from app.config import get_settings, get_llm
 from app.tools import hr_tools, ml_tools, report_tools, calendar_tools
 from app.prompts import (
@@ -108,7 +116,7 @@ def build_hr_agent():
         return {"messages": [response]}
 
     # Costruisce il grafo ReAct
-    graph = StateGraph(dict)
+    graph = StateGraph(AgentState)
     graph.add_node("llm",   hr_llm_node)
     graph.add_node("tools", ToolNode(hr_tools))
 
@@ -147,7 +155,7 @@ def build_ml_agent():
 
         return {"messages": [response]}
 
-    graph = StateGraph(dict)
+    graph = StateGraph(AgentState)
     graph.add_node("llm",   ml_llm_node)
     graph.add_node("tools", ToolNode(ml_tools))
 
@@ -189,7 +197,7 @@ def build_report_agent():
 
         return {"messages": [response]}
 
-    graph = StateGraph(dict)
+    graph = StateGraph(AgentState)
     graph.add_node("llm",   report_llm_node)
     graph.add_node("tools", ToolNode(report_tools))
 
@@ -242,7 +250,7 @@ Formato data: YYYY-MM-DD | Formato ora: HH:MM"""
         response   = llm.invoke([system_msg] + messages)
         return {"messages": [response]}
 
-    graph = StateGraph(dict)
+    graph = StateGraph(AgentState)
     graph.add_node("llm",   calendar_llm_node)
     graph.add_node("tools", ToolNode(calendar_tools))
 
