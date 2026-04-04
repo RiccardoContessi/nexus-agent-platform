@@ -11,3 +11,9 @@ memory.comments.py
 # Non carico pdf:
 scripts/docs/hr/*
 scripts/docs/ml/*
+
+# credenziali 
+google_service_account.json
+
+
+*.db
