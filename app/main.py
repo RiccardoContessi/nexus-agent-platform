@@ -392,24 +392,24 @@ async def chat_stream(
     }
 
     async def event_generator():
-        """
-        Generatore asincrono che produce eventi SSE.
-        Formato SSE: "data: <contenuto>\n\n"
-        """
         async for event in supervisor.astream_events(
-            initial_state,
-            {"configurable": {"thread_id": str(conversation_id)}},
-            version="v2",
+            initial_state, config, version="v2"
         ):
-            # Filtra solo gli eventi di streaming del modello chat
             if event["event"] == "on_chat_model_stream":
+                # Ignora gli stream del supervisor_node
+                metadata = event.get("metadata", {})
+                langgraph_node = metadata.get("langgraph_node", "")
+                if langgraph_node == "supervisor":
+                    continue
+                
                 chunk = event["data"].get("chunk")
                 if chunk and hasattr(chunk, "content") and chunk.content:
-                    # Formato SSE standard
                     yield f"data: {chunk.content}\n\n"
 
-        # Segnale di fine stream
         yield "data: [DONE]\n\n"
+
+
+    config = {"configurable": {"thread_id": str(conversation_id)}}
 
     return StreamingResponse(
         event_generator(),
