@@ -236,8 +236,8 @@ def write_event_direct(event_details: dict) -> dict:
     Returns:
         dict con event_id e link dell'evento creato
     """
-    calendar_id = "primary"  # default — usa il calendario principale dell'utente
-
+    calendar_id = settings.google_calendar_id
+    
     result_str = _write_calendar_event(
         calendar_id  = calendar_id,
         titolo       = event_details["titolo"],

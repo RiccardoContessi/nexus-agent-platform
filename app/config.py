@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     postgres_url                : str
     jwt_secret_key              : str
     google_service_account_path : str
+    google_calendar_id          : str = "primary" 
 
     # --- Campi opzionali con default ---
     llm_model                   : str  = "gpt-4o-mini"
