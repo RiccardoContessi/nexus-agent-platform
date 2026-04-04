@@ -32,10 +32,10 @@ load_dotenv()
 # Mappa namespace → lista di PDF da indicizzare
 # Ogni namespace è una "sezione" logica dentro l'unico indice Pinecone
 DOCUMENTS = {
-    "hr_policy"   : ["docs/hr/policy.pdf"],
-    "hr_faq"      : ["docs/hr/faq.pdf"],
-    "hr_contracts": ["docs/hr/contracts.pdf"],
-    "ml_docs"     : ["docs/ml/intro.pdf", "docs/ml/advanced.pdf"],
+    "hr_policy"   : ["scripts/docs/hr/policy.pdf"],
+    "hr_faq"      : ["scripts/docs/hr/faq.pdf"],
+    "hr_contracts": ["scripts/docs/hr/contracts.pdf"],
+    "ml_docs"     : ["scripts/docs/ml/intro.pdf", "scripts/docs/ml/advanced.pdf"],
 }
 
 PINECONE_INDEX  = os.getenv("PINECONE_INDEX", "exerag")

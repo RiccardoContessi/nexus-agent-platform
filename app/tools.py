@@ -48,6 +48,7 @@ def _get_vectorstore(namespace: str) -> PineconeVectorStore:
         index_name=settings.pinecone_index,
         embedding=embeddings,
         namespace=namespace,
+        pinecone_api_key=settings.pinecone_api_key,  # ← aggiungi questa riga
     )
 
 
