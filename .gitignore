@@ -17,3 +17,4 @@ google_service_account.json
 
 
 *.db
+__pycache__

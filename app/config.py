@@ -44,17 +44,15 @@ def get_llm(temperature: float = 0) -> ChatOpenAI:
     settings = get_settings()
     try:
         llm = ChatOpenAI(
-            model       = settings.llm_model,
-            api_key     = settings.openai_api_key,
-            temperature = temperature,
+            model=settings.llm_model,
+            api_key=settings.openai_api_key,
+            temperature=temperature,
         )
-        # Test rapido — verifica che la chiave sia valida senza fare una chiamata reale
-        llm.client.models.list()
         return llm
     except (openai.AuthenticationError, openai.RateLimitError):
         return ChatOpenAI(
-            model       = settings.fallback_model,
-            api_key     = settings.groq_api_key,
-            base_url    = settings.fallback_base_url,
-            temperature = temperature,
+            model=settings.fallback_model,
+            api_key=settings.groq_api_key,
+            base_url=settings.fallback_base_url,
+            temperature=temperature,
         )
