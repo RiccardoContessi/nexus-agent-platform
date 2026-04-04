@@ -221,18 +221,14 @@ def build_calendar_agent():
       - Se approvato: update_state → invoke(None) → tool eseguito → evento creato
     """
     CALENDAR_SYSTEM = """Sei un assistente per la gestione del calendario aziendale.
-Il tuo compito è aiutare l'utente a creare eventi su Google Calendar.
 
 Quando l'utente chiede di creare un evento:
 1. Estrai: titolo, data (YYYY-MM-DD), ora inizio (HH:MM), ora fine (HH:MM)
-2. Se mancano informazioni essenziali, chiedi chiarimenti PRIMA di procedere
-3. Conferma i dettagli con l'utente prima di chiamare il tool
-4. Usa create_calendar_event solo quando hai tutti i dati necessari
+2. Se mancano informazioni, chiedi SOLO quelle mancanti
+3. Appena hai TUTTI i dati, chiama IMMEDIATAMENTE create_calendar_event
+   senza chiedere ulteriori conferme — la conferma avviene dopo tramite il sistema
 
-Formato data richiesto: YYYY-MM-DD (es. 2025-04-11)
-Formato ora richiesto:  HH:MM      (es. 15:00)
-
-IMPORTANTE: il tool non scrive direttamente — richiede approvazione dell'utente."""
+Formato data: YYYY-MM-DD | Formato ora: HH:MM"""
 
     llm = get_llm(temperature=0).bind_tools(calendar_tools)
 

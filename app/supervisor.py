@@ -412,4 +412,4 @@ def build_supervisor():
 
     graph.add_edge("summarize", END)
 
-    return graph.compile(checkpointer=MemorySaver())
+    return graph.compile()
