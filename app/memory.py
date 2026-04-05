@@ -47,10 +47,9 @@ def summarize_node(state: dict) -> dict:
       - Il nuovo summary integra quello vecchio + i messaggi compressi
       - Restituisce lo state aggiornato con summary nuovo e history ridotta
 
-    Perché tenere gli ultimi 4?
-      Gli ultimi messaggi sono il contesto immediato della conversazione corrente.
-      Comprimerli subito farebbe perdere il filo del dialogo in corso.
-      4 = 2 turni completi (human + ai) — sufficiente per la continuità.
+    Gli ultimi messaggi sono il contesto immediato della conversazione corrente.
+    Comprimerli subito farebbe perdere il filo del dialogo in corso.
+    4 = 2 turni completi (human + ai) — sufficiente per la continuità.
 
     Returns:
         dict con i campi dello state aggiornati — LangGraph li merge automaticamente
@@ -89,7 +88,7 @@ Produci il nuovo riassunto cumulativo:"""
 
     # Restituisce solo i campi che cambiano — LangGraph fa il merge con il resto
     return {
-        "messages": messages_to_keep,   # history ridotta
+        "messages": messages_to_keep,    # history ridotta
         "summary" : new_summary,         # riassunto cumulativo aggiornato
     }
 
