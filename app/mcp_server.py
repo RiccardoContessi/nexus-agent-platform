@@ -1,25 +1,6 @@
 # =============================================================================
 # app/mcp_server.py — MCP Server per Google Calendar
 # =============================================================================
-# MCP (Model Context Protocol) è un protocollo standard Anthropic che permette
-# agli LLM di scoprire e usare tool esposti da server esterni in modo dinamico.
-#
-# Differenza con API diretta:
-#   API diretta → tu scrivi il codice che chiama Google Calendar, l'LLM non sa
-#                 che esiste fino a quando non glielo dici esplicitamente.
-#   MCP         → il server espone i tool con schema, l'LLM li scopre da solo
-#                 interrogando il server — aggiungere tool non richiede
-#                 modifiche al codice dell'agente.
-#
-# Flusso in questo progetto:
-#   1. Il lifespan FastAPI avvia il MCP Server in un thread separato
-#   2. Il Calendar Agent, dopo l'approvazione HITL, chiama write_calendar_event
-#      tramite il server MCP invece che direttamente
-#   3. Il server MCP autentica con Google tramite Service Account e crea l'evento
-#
-# Installazione:
-#   pip install mcp google-auth google-auth-httplib2 google-api-python-client
-# =============================================================================
 
 import json
 import threading
@@ -41,11 +22,6 @@ settings = get_settings()
 # =============================================================================
 # AUTENTICAZIONE GOOGLE — Service Account
 # =============================================================================
-# Il Service Account è un account non-umano usato dalle applicazioni per
-# autenticarsi con Google senza intervento dell'utente.
-# Non richiede OAuth2 interattivo — funziona in modo headless (senza browser).
-# Le credenziali sono nel file JSON referenziato in settings.
-
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 
@@ -291,46 +267,3 @@ def start_mcp_server():
         print(f"[MCP Server] Errore: {e}")
     finally:
         loop.close()
-
-
-# =============================================================================
-# MAPPA DELLE CHIAMATE
-# =============================================================================
-#
-#  FLUSSO NORMALE (dopo approvazione HITL):
-#  ─────────────────────────────────────────
-#  POST /v1/approve {approved: true}
-#      │
-#      ▼
-#  main.py — endpoint approve
-#      │  legge pending_calendar_event dallo State
-#      │  chiama write_event_direct(event_details)   ← mcp_server.py
-#      │      └→ _write_calendar_event()
-#      │              └→ service.events().insert()   ← Google Calendar API
-#      │
-#      └→ risposta con event_id e link
-#
-#  FLUSSO MCP (scoperta dinamica del tool):
-#  ─────────────────────────────────────────
-#  LLM chiede lista tool al server MCP
-#      │
-#      ▼
-#  list_tools() → restituisce schema di write_calendar_event
-#      │
-#  LLM decide di usare write_calendar_event
-#      │
-#      ▼
-#  call_tool("write_calendar_event", {...})
-#      │
-#      └→ _write_calendar_event() → Google Calendar API
-#
-#  AVVIO:
-#  ──────
-#  FastAPI lifespan
-#      │
-#      ▼
-#  threading.Thread(target=start_mcp_server, daemon=True).start()
-#      │
-#      ▼
-#  MCP Server in ascolto su stdio in thread separato
-#  FastAPI continua il suo avvio normalmente
