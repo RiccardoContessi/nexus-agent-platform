@@ -65,19 +65,19 @@ async def lifespan(app: FastAPI):
     # 1. Crea le tabelle PostgreSQL se non esistono
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    print("  ✅ PostgreSQL — tabelle pronte")
+    print("PostgreSQL — tabelle pronte")
 
     # 2. Inizializza il Supervisor (costruisce i 4 sotto-agenti)
     app.state.supervisor = build_supervisor()
-    print("  ✅ Supervisor — agenti inizializzati")
+    print("Supervisor — agenti inizializzati")
 
     # 3. Avvia il MCP Server in un thread daemon separato
     mcp_thread = threading.Thread(target=start_mcp_server, daemon=True)
     mcp_thread.start()
-    print("  ✅ MCP Server — avviato in thread separato")
+    print("MCP Server — avviato in thread separato")
 
-    print(f"  📋 Prompt Repetition: {'ABILITATA' if settings.use_prompt_repetition else 'DISABILITATA'}")
-    print(f"  🗄️  Database: {settings.postgres_url.split('@')[-1]}")  # stampa solo host/db
+    print(f"Prompt Repetition: {'ABILITATA' if settings.use_prompt_repetition else 'DISABILITATA'}")
+    print(f"Database: {settings.postgres_url.split('@')[-1]}")  # stampa solo host/db
     print(f"{'='*55}\n")
 
     yield  # app in esecuzione
