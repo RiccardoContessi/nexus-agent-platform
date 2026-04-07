@@ -1,0 +1,74 @@
+# ============================================================
+# docker-compose.yml — Enterprise Agent Platform
+# ============================================================
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: enterprise-db
+
+    environment:
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB:       nexus
+
+    volumes:
+      # Volume nominato — i dati sopravvivono al restart del container
+      - postgres_data:/var/lib/postgresql/data
+
+    ports:
+      # Espone sulla 5433 dell'host per evitare conflitti con Postgres locale
+      - "5433:5432"
+
+    healthcheck:
+      # pg_isready verifica che PostgreSQL accetti connessioni
+      # -U: utente, -d: database
+      test: ["CMD-SHELL", "pg_isready -U postgres -d nexus"]
+      interval: 10s   # controlla ogni 10s
+      timeout:  5s    # aspetta max 5s per risposta
+      retries:  5     # dopo 5 fallimenti → unhealthy
+
+    restart: unless-stopped
+
+
+  # ── FastAPI ────────────────────────────────────────────────
+  api:
+    build:
+      context: .        # cartella root del progetto
+      dockerfile: Dockerfile
+
+    container_name: enterprise-api
+
+    env_file:
+      - .env
+      # Il .env deve contenere:
+      # POSTGRES_URL=postgresql+asyncpg://postgres:password123@db:5433/nexus
+      #                                                         ↑
+      #                                              "db" = nome servizio Docker
+      #                                              Docker risolve "db" → IP container
+
+    volumes:
+      # Monta credentials in sola lettura — non viene copiata nell'immagine
+      - ./credentials:/app/credentials:ro
+
+    ports:
+      - "8000:8000"
+
+    depends_on:
+      db:
+        condition: service_healthy
+        # FONDAMENTALE: l'API si avvia SOLO dopo che il db è healthy
+        # Senza questo il lifespan crasha perché PostgreSQL non è pronto
+        # "service_started" non è sufficiente — PostgreSQL impiega secondi ad avviarsi
+
+    restart: unless-stopped
+
+
+# ── Volumi ───────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    # Volume nominato gestito da Docker
+    # I dati persistono anche se fai docker-compose down
+    # docker-compose down -v li cancella

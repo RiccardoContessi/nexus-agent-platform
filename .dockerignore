@@ -1,0 +1,48 @@
+# ============================================================
+# .dockerignore — esclude file non necessari dall'immagine
+# ============================================================
+
+# Secrets — MAI nell'immagine
+.env
+credentials/
+
+# Database locali
+*.db
+*.sqlite
+
+# Python cache — inutili nell'immagine
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Git — non serve al runtime
+.git
+.gitignore
+
+# Evaluation — script standalone, non servono all'API
+evaluation/
+
+# Ambienti virtuali locali
+.venv/
+venv/
+env/
+
+# Editor e OS
+.vscode/
+.idea/
+*.DS_Store
+
+# Log locali
+*.log
+logs/
+
+# Test
+tests/
+pytest.ini
+.pytest_cache/
+
+# Documentazione
+*.md
+docs/

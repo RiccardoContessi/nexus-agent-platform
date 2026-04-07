@@ -8,6 +8,7 @@ database.comments.py
 auth.comments.py
 memory.comments.py
 mcp_server.comments.py
+docker.comment.py
 
 # Non carico pdf:
 scripts/docs/hr/*
