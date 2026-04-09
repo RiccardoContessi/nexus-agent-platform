@@ -114,6 +114,22 @@ def _docs_to_string(docs: list[Document]) -> str:
     return "\n\n---\n\n".join(chunks)
 
 
+def _docs_to_string_no_metadata(docs: list[Document]) -> str:
+    """
+    Variante di _docs_to_string usata SOLO da generate_report.
+
+    A differenza di _docs_to_string, NON include alcun metadato (source, path,
+    namespace, topic, nome file) — solo il contenuto testuale dei chunk
+    separato da divisori. Evita che path locali Windows o nomi di file PDF
+    finiscano nella sezione "Fonti" del report finale generato dall'LLM.
+    """
+    if not docs:
+        return "Nessun documento trovato."
+
+    chunks = [doc.page_content for doc in docs]
+    return "\n\n---\n\n".join(chunks)
+
+
 # =============================================================================
 # TOOL 1 — HR Documents (3 namespace in parallelo)
 # =============================================================================
@@ -239,18 +255,20 @@ def generate_report(topic: str, include_hr: bool = True, include_ml: bool = True
         return "Nessun documento trovato per generare il report."
 
     # ── 2. RERANKING ─────────────────────────────────────────────────────────
+    # Nota: il context viene costruito con _docs_to_string_no_metadata per
+    # evitare che path locali (es. C:\...\faq.pdf) finiscano nel report.
     try:
         t_rerank = time.perf_counter()
         reranked = _rerank(topic, all_docs, top_n=5)
-        context  = _docs_to_string(reranked)
+        context  = _docs_to_string_no_metadata(reranked)
         logger.info(
             f"[Report Tool] Rerank di {len(all_docs)} docs → top {len(reranked)} "
             f"in {time.perf_counter() - t_rerank:.2f}s"
         )
     except Exception as e:
         logger.warning(f"[Report Tool] Rerank fallito, uso docs grezzi: {e}")
-        # Fallback: salta il rerank, usa i primi 5 documenti grezzi
-        context = _docs_to_string(all_docs[:5])
+        # Fallback: salta il rerank, usa i primi 5 documenti grezzi (senza metadata)
+        context = _docs_to_string_no_metadata(all_docs[:5])
 
     # ── 3. GENERAZIONE LLM ───────────────────────────────────────────────────
     # Wrappato in try/except: in caso di errore o timeout restituisce comunque
@@ -278,7 +296,10 @@ Il report deve seguire questa struttura:
 ## Conclusioni e Raccomandazioni
 [Punti chiave actionable]
 
-Sii completo, preciso e cita le fonti quando possibile."""
+Sii completo e preciso. NON includere sezioni "Fonti", "References", "Sources"
+o "Bibliografia". NON mostrare percorsi di file, URL, path locali o nomi di
+file PDF. Non citare i documenti per nome — usa al massimo riferimenti
+generici al dominio (es. "secondo le policy HR")."""
 
     try:
         t_llm = time.perf_counter()
@@ -292,14 +313,15 @@ Sii completo, preciso e cita le fonti quando possibile."""
         return response.content if hasattr(response, "content") else str(response)
     except Exception as e:
         logger.error(f"[Report Tool] LLM invoke fallito: {e}")
-        # Fallback: restituisce un report minimale costruito dal context grezzo,
-        # così l'agente termina invece di rimanere appeso.
+        # Fallback: restituisce un report minimale costruito dal context grezzo
+        # (già senza metadata grazie a _docs_to_string_no_metadata), così
+        # l'agente termina invece di rimanere appeso. Niente sezione "Fonti".
         return (
             f"# Report su: {topic}\n\n"
             f"## Sommario\n"
             f"Generazione automatica fallita ({e}). "
-            f"Di seguito i documenti rilevanti recuperati dalle knowledge base.\n\n"
-            f"## Documenti di riferimento\n\n{context}"
+            f"Di seguito i contenuti rilevanti recuperati dalle knowledge base.\n\n"
+            f"## Contenuti rilevanti\n\n{context}"
         )
 
 

@@ -139,8 +139,16 @@ Linee guida:
 - Usa SEMPRE Markdown strutturato con titoli e sezioni numerate.
 - Incrocia le informazioni da fonti diverse quando rilevante.
 - Sii esaustivo ma conciso — privilegia la densità informativa.
-- Cita le fonti quando possibile (es. "[Policy HR]", "[Docs ML]").
-- Le conclusioni devono essere actionable, non generiche."""
+- Le conclusioni devono essere actionable, non generiche.
+
+Regole tassative sull'output:
+- Non includere MAI sezioni "Fonti", "References", "Sources", "Bibliografia"
+  o equivalenti nella risposta.
+- Non mostrare MAI percorsi di file, URL, path locali, nomi di file PDF o
+  riferimenti a directory (es. C:\\..., /home/..., scripts/docs/...).
+- Non citare i documenti per nome o path. Se devi attribuire un'informazione,
+  usa al massimo un riferimento generico al dominio (es. "secondo le policy
+  HR", "secondo la documentazione tecnica") senza nominare file o sorgenti."""
 
 
 # =============================================================================
