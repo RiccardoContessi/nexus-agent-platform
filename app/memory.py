@@ -10,9 +10,10 @@ from sqlalchemy import select, update
 from app.config import get_settings, get_llm
 from app.models import Conversation, Message
 from app.prompts import SUMMARIZE_PROMPT
+import logging
 
 settings = get_settings()
-
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # 1. SHOULD SUMMARIZE — quando comprimere
@@ -83,9 +84,9 @@ Produci il nuovo riassunto cumulativo:"""
     llm          = get_llm(temperature=0)
     new_summary  = llm.invoke(prompt).content.strip()
 
-    print(f"[Memory] Compressi {len(messages_to_compress)} messaggi → summary aggiornato")
-    print(f"[Memory] Messaggi mantenuti: {len(messages_to_keep)}")
-
+    logger.info(f"[Memory] Compressi {len(messages_to_compress)} messaggi → summary aggiornato")
+    logger.info(f"[Memory] Messaggi mantenuti: {len(messages_to_keep)}")
+    
     # Restituisce solo i campi che cambiano — LangGraph fa il merge con il resto
     return {
         "messages": messages_to_keep,    # history ridotta
@@ -202,8 +203,8 @@ async def load_from_db(
             lc_messages.append(AIMessage(content=msg.content))
         # Altri ruoli (tool, system) vengono ignorati — non servono per la history
 
-    print(f"[Memory] Caricati {len(lc_messages)} messaggi + summary ({len(conv.summary)} chars)")
-
+    logger.info(f"[Memory] Caricati {len(lc_messages)} messaggi + summary ({len(conv.summary)} chars)")
+    
     return {
         "messages": lc_messages,
         "summary" : conv.summary or "",

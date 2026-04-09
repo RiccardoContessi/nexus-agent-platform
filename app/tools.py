@@ -26,6 +26,8 @@ from langchain_core.documents import Document
 from flashrank import Ranker, RerankRequest
 
 from app.config import get_settings, get_llm
+import logging
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -151,9 +153,9 @@ def search_hr_documents(query: str) -> str:
         for doc in ns_docs:          
             all_docs.append(doc)
 
-    print(f"[HR Tool] Recuperati {len(all_docs)} docs da {len(HR_NAMESPACES)} namespace "
-          f"in {t_parallel:.2f}s (parallelo)")
-
+    logger.info(f"[HR Tool] Recuperati {len(all_docs)} docs da {len(HR_NAMESPACES)} namespace "
+            f"in {t_parallel:.2f}s (parallelo)")
+    
     # Reranking sull'insieme combinato → top 5
     reranked = _rerank(query, all_docs, top_n=5)
 
@@ -180,7 +182,7 @@ def search_ml_documents(query: str) -> str:
     docs = _retrieve("ml_docs", query, k=settings.retriever_k)
 
     t_retrieval = time.perf_counter() - t_start
-    print(f"[ML Tool] Recuperati {len(docs)} docs in {t_retrieval:.2f}s")
+    logger.info(f"[ML Tool] Recuperati {len(docs)} docs in {t_retrieval:.2f}s")
 
     reranked = _rerank(query, docs, top_n=5)
 

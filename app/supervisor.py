@@ -38,6 +38,8 @@ from app.agents import (
     build_calendar_agent,
 )
 from app.memory import should_summarize, summarize_node
+import logging
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -104,7 +106,7 @@ def supervisor_node(state: SupervisorState) -> dict:
         [SystemMessage(content=system_content)] + messages
     )
 
-    print(f"[Supervisor] Routing → {routing.agente} | {routing.motivazione}")
+    logger.info(f"[Supervisor] Routing → {routing.agente} | {routing.motivazione}")
 
     return {"routing": routing}
 
@@ -204,7 +206,7 @@ def hr_node(state: SupervisorState) -> dict:
     risposta   = _extract_final_response(result)
     tools_used = _extract_tools_used(result)
 
-    print(f"[HR Node] Risposta generata | Tool usati: {tools_used}")
+    logger.info(f"[HR Node] Risposta generata | Tool usati: {tools_used}")
 
     return {
         "messages"    : [AIMessage(content=risposta)],
@@ -228,7 +230,7 @@ def ml_node(state: SupervisorState) -> dict:
     risposta   = _extract_final_response(result)
     tools_used = _extract_tools_used(result)
 
-    print(f"[ML Node] Risposta generata | Tool usati: {tools_used}")
+    logger.info(f"[ML Node] Risposta generata | Tool usati: {tools_used}")
 
     return {
         "messages"    : [AIMessage(content=risposta)],
@@ -252,7 +254,7 @@ def report_node(state: SupervisorState) -> dict:
     risposta   = _extract_final_response(result)
     tools_used = _extract_tools_used(result)
 
-    print(f"[Report Node] Report generato | Tool usati: {tools_used}")
+    logger.info(f"[Report Node] Report generato | Tool usati: {tools_used}")
 
     return {
         "messages"    : [AIMessage(content=risposta)],
@@ -293,8 +295,8 @@ def calendar_node(state: SupervisorState) -> dict:
         # Estrae i dettagli dell'evento dall'ultimo AIMessage o ToolCall
         event_details = _extract_pending_event(agent_state)
 
-        print(f"[Calendar Node] HITL attivato — evento in attesa di approvazione")
-        print(f"[Calendar Node] Dettagli: {event_details}")
+        logger.info(f"[Calendar Node] HITL attivato — evento in attesa di approvazione")
+        logger.info(f"[Calendar Node] Dettagli: {event_details}")
 
         return {
             "agente_usato"           : "calendar_agent",
@@ -308,7 +310,7 @@ def calendar_node(state: SupervisorState) -> dict:
         risposta   = _extract_final_response({"messages": messages})
         tools_used = _extract_tools_used({"messages": messages})
 
-        print(f"[Calendar Node] Risposta diretta (no interrupt)")
+        logger.info(f"[Calendar Node] Risposta diretta (no interrupt)")
 
         return {
             "messages"               : [AIMessage(content=risposta)],
@@ -357,7 +359,7 @@ def should_summarize_edge(state: SupervisorState) -> Literal["summarize", END]:
     Altrimenti → END direttamente.
     """
     if should_summarize(state):
-        print(f"[Supervisor] Soglia summary raggiunta ({len(state['messages'])} msg) → compressione")
+        logger.info(f"[Supervisor] Soglia summary raggiunta ({len(state['messages'])} msg) → compressione")
         return "summarize"
     return END
 
@@ -379,12 +381,12 @@ def build_supervisor():
     global _hr_agent, _ml_agent, _report_agent, _calendar_agent
 
     # Inizializza i sotto-agenti una volta sola
-    print("[Supervisor] Inizializzazione sotto-agenti...")
+    logger.info("[Supervisor] Inizializzazione sotto-agenti...")
     _hr_agent       = build_hr_agent()
     _ml_agent       = build_ml_agent()
     _report_agent   = build_report_agent()
     _calendar_agent = build_calendar_agent()
-    print("[Supervisor] Sotto-agenti pronti")
+    logger.info("[Supervisor] Sotto-agenti pronti")
 
     # Costruisce il grafo del Supervisor
     graph = StateGraph(SupervisorState)

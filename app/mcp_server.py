@@ -16,7 +16,9 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 from app.config import get_settings
+import logging
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 # =============================================================================
@@ -128,6 +130,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         return [types.TextContent(type="text", text=f"Errore creazione evento: {str(e)}")]
 
 
+
 def _write_calendar_event(
     calendar_id: str,
     titolo: str,
@@ -140,7 +143,6 @@ def _write_calendar_event(
     Funzione interna che scrive effettivamente su Google Calendar.
     Separata dal tool MCP per poter essere chiamata anche direttamente
     da POST /v1/approve senza passare per il protocollo MCP.
-
     Args:
         calendar_id: 'primary' oppure l'email del calendario specifico
         titolo:      titolo dell'evento
@@ -148,53 +150,40 @@ def _write_calendar_event(
         ora_inizio:  HH:MM
         ora_fine:    HH:MM
         descrizione: testo opzionale
-
     Returns:
         JSON string con id evento e link di accesso
     """
-    service = get_google_service()
+    try:
+        service = get_google_service()
+        timezone = "Europe/Rome"
+        start_dt = f"{data}T{ora_inizio}:00"
+        end_dt   = f"{data}T{ora_fine}:00"
+        event_body = {
+            "summary"    : titolo,
+            "description": descrizione,
+            "start": {"dateTime": start_dt, "timeZone": timezone},
+            "end"  : {"dateTime": end_dt,   "timeZone": timezone},
+            "reminders": {"useDefault": True},
+        }
+        created_event = service.events().insert(
+            calendarId=calendar_id,
+            body=event_body,
+        ).execute()
+        result = {
+            "status"  : "creato",
+            "event_id": created_event.get("id"),
+            "link"    : created_event.get("htmlLink"),
+            "titolo"  : titolo,
+            "data"    : data,
+            "inizio"  : ora_inizio,
+            "fine"    : ora_fine,
+        }
+        logger.info(f"[MCP] Evento creato: {result['link']}")
+        return json.dumps(result, ensure_ascii=False)
 
-    # Costruisce il datetime completo nel formato RFC3339 richiesto da Google
-    # Es: "2025-04-11T15:00:00" (timezone Europe/Rome per utenti italiani)
-    timezone = "Europe/Rome"
-    start_dt = f"{data}T{ora_inizio}:00"
-    end_dt   = f"{data}T{ora_fine}:00"
-
-    # Corpo dell'evento nel formato Google Calendar API
-    event_body = {
-        "summary"    : titolo,
-        "description": descrizione,
-        "start": {
-            "dateTime": start_dt,
-            "timeZone": timezone,
-        },
-        "end": {
-            "dateTime": end_dt,
-            "timeZone": timezone,
-        },
-        "reminders": {
-            "useDefault": True,  # usa i promemoria default del calendario
-        },
-    }
-
-    # Chiama Google Calendar API — crea l'evento
-    created_event = service.events().insert(
-        calendarId=calendar_id,
-        body=event_body,
-    ).execute()
-
-    result = {
-        "status"  : "creato",
-        "event_id": created_event.get("id"),
-        "link"    : created_event.get("htmlLink"),
-        "titolo"  : titolo,
-        "data"    : data,
-        "inizio"  : ora_inizio,
-        "fine"    : ora_fine,
-    }
-
-    return json.dumps(result, ensure_ascii=False)
-
+    except Exception as e:
+        logger.error(f"[MCP] Errore scrittura calendario: {type(e).__name__}: {e}")
+        raise
 
 # =============================================================================
 # FUNZIONE PUBBLICA — chiamata da POST /v1/approve
