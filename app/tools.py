@@ -201,28 +201,60 @@ def generate_report(topic: str, include_hr: bool = True, include_ml: bool = True
     documenti che richiedono informazioni da fonti diverse (policy HR + contenuti tecnici ML),
     sintesi di argomenti complessi in formato professionale con sezioni e conclusioni.
     """
+    t_start = time.perf_counter()
+
+    # ── 1. RETRIEVAL ─────────────────────────────────────────────────────────
+    K_PER_NS = 2
     all_docs = []
 
-    # Recupera documenti dai namespace richiesti
-    if include_hr:
-        hr_namespaces = ["hr_policy", "hr_faq", "hr_contracts"]
-        for ns in hr_namespaces:
-            docs = _retrieve(ns, topic, k=3)  # k ridotto per non sovraccaricare il contesto
-            all_docs.extend(docs)
+    try:
+        namespaces = []
+        if include_hr:
+            namespaces.extend(["hr_policy", "hr_faq", "hr_contracts"])
+        if include_ml:
+            namespaces.append("ml_docs")
 
-    if include_ml:
-        ml_docs = _retrieve("ml_docs", topic, k=3)
-        all_docs.extend(ml_docs)
+        if not namespaces:
+            return "Nessun namespace selezionato per il report."
+
+        # Retrieval sequenziale ma con per-namespace try/except: se un namespace
+        # fallisce gli altri proseguono comunque.
+        for ns in namespaces:
+            try:
+                docs = _retrieve(ns, topic, k=K_PER_NS)
+                all_docs.extend(docs)
+            except Exception as e:
+                logger.warning(f"[Report Tool] Retrieval namespace '{ns}' fallito: {e}")
+                continue
+
+        logger.info(
+            f"[Report Tool] Recuperati {len(all_docs)} docs da {len(namespaces)} namespace "
+            f"in {time.perf_counter() - t_start:.2f}s"
+        )
+    except Exception as e:
+        logger.error(f"[Report Tool] Errore durante il retrieval: {e}")
+        return f"Errore durante il recupero dei documenti per il report: {e}"
 
     if not all_docs:
         return "Nessun documento trovato per generare il report."
 
-    # Reranking sull'insieme combinato
-    reranked = _rerank(topic, all_docs, top_n=8)
-    context  = _docs_to_string(reranked)
+    # ── 2. RERANKING ─────────────────────────────────────────────────────────
+    try:
+        t_rerank = time.perf_counter()
+        reranked = _rerank(topic, all_docs, top_n=5)
+        context  = _docs_to_string(reranked)
+        logger.info(
+            f"[Report Tool] Rerank di {len(all_docs)} docs → top {len(reranked)} "
+            f"in {time.perf_counter() - t_rerank:.2f}s"
+        )
+    except Exception as e:
+        logger.warning(f"[Report Tool] Rerank fallito, uso docs grezzi: {e}")
+        # Fallback: salta il rerank, usa i primi 5 documenti grezzi
+        context = _docs_to_string(all_docs[:5])
 
-    # Chiede all'LLM di generare il report strutturato
-    llm = get_llm(temperature=0)
+    # ── 3. GENERAZIONE LLM ───────────────────────────────────────────────────
+    # Wrappato in try/except: in caso di errore o timeout restituisce comunque
+    # una stringa invece di rimanere appeso indefinitamente.
     prompt = f"""Sei un assistente specializzato nella generazione di report aziendali.
 
 Genera un report professionale e strutturato in Markdown sul seguente argomento: {topic}
@@ -248,8 +280,27 @@ Il report deve seguire questa struttura:
 
 Sii completo, preciso e cita le fonti quando possibile."""
 
-    response = llm.invoke(prompt)
-    return response.content
+    try:
+        t_llm = time.perf_counter()
+        llm = get_llm(temperature=0)
+        # request_timeout su ChatOpenAI: 25s evita blocchi infiniti del Report Agent
+        response = llm.invoke(prompt, config={"timeout": 25})
+        logger.info(
+            f"[Report Tool] LLM completato in {time.perf_counter() - t_llm:.2f}s "
+            f"(totale: {time.perf_counter() - t_start:.2f}s)"
+        )
+        return response.content if hasattr(response, "content") else str(response)
+    except Exception as e:
+        logger.error(f"[Report Tool] LLM invoke fallito: {e}")
+        # Fallback: restituisce un report minimale costruito dal context grezzo,
+        # così l'agente termina invece di rimanere appeso.
+        return (
+            f"# Report su: {topic}\n\n"
+            f"## Sommario\n"
+            f"Generazione automatica fallita ({e}). "
+            f"Di seguito i documenti rilevanti recuperati dalle knowledge base.\n\n"
+            f"## Documenti di riferimento\n\n{context}"
+        )
 
 
 # =============================================================================
