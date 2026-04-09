@@ -178,7 +178,13 @@ def build_report_agent():
     Usa generate_report che incrocia namespace HR e ML.
     Output sempre in formato Markdown con titolo, sezioni e conclusioni.
     """
+    # Prima iterazione: LLM con tools bound — può chiamare generate_report.
     llm = get_llm(temperature=0).bind_tools(report_tools)
+    # Seconda iterazione: LLM SENZA tools — impedisce loop ricorsivo del tool
+    # generate_report (la cui description matcha sempre la query "report").
+    # Pattern identico nello spirito a HR/ML, ma necessario qui perché il tool
+    # è "self-fulfilling": il suo output è già la risposta finale.
+    llm_no_tools = get_llm(temperature=0)
 
     def report_llm_node(state: dict) -> dict:
         messages = state.get("messages", [])
@@ -188,12 +194,14 @@ def build_report_agent():
         system   = _build_system_with_summary(REPORT_SYSTEM_PROMPT, summary)
 
         if context:
-            # Il tool generate_report restituisce già Markdown strutturato.
-            # build_rag_prompt lo usa come context — l'LLM può raffinarlo
-            # o restituirlo direttamente se già completo.
+            # Documenti recuperati (ToolMessage presente) — costruisce la risposta
+            # finale con build_rag_prompt. Usa llm_no_tools per garantire che
+            # l'LLM produca testo invece di richiamare ancora generate_report.
             final_prompt = build_rag_prompt(query, context, system)
-            response = llm.invoke([HumanMessage(content=final_prompt)])
+            response = llm_no_tools.invoke([HumanMessage(content=final_prompt)])
         else:
+            # Prima iterazione — nessun report ancora generato.
+            # L'LLM (con tools) decide di chiamare generate_report (ciclo ReAct).
             system_msg = SystemMessage(content=system)
             response   = llm.invoke([system_msg] + messages)
 
