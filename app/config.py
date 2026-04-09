@@ -1,3 +1,6 @@
+import base64
+import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -12,8 +15,14 @@ class Settings(BaseSettings):
     pinecone_index              : str
     postgres_url                : str
     jwt_secret_key              : str
-    google_service_account_path : str
-    google_calendar_id          : str = "primary" 
+    google_calendar_id          : str = "primary"
+
+    # --- Credenziali Google: una delle due forme è richiesta ---
+    # Locale/Docker: path al file JSON Service Account montato come volume
+    google_service_account_path : str = ""
+    # Railway/cloud: contenuto JSON Service Account codificato in base64
+    # (i provider cloud non permettono volumi per file segreti)
+    google_credentials_b64      : str = ""
 
     # --- Campi opzionali con default ---
     llm_model                   : str  = "gpt-4o-mini"
@@ -38,6 +47,75 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+# =============================================================================
+# Google Service Account — risoluzione path multi-ambiente
+# =============================================================================
+
+# Path del file temporaneo materializzato dal contenuto base64.
+# Cache module-level: la decodifica avviene una volta sola per processo,
+# le chiamate successive riusano lo stesso file.
+_GOOGLE_CREDS_TMP_PATH: str | None = None
+
+
+def get_google_credentials_path() -> str:
+    """
+    Restituisce il path al JSON Service Account di Google, scegliendo
+    automaticamente la fonte in base all'ambiente:
+
+      1. Se GOOGLE_CREDENTIALS_B64 è valorizzato (deploy cloud, es. Railway):
+         decodifica il contenuto da base64 e lo materializza in un file
+         temporaneo (/tmp/google_credentials.json o equivalente OS).
+         Restituisce il path del file temporaneo.
+
+      2. Se GOOGLE_SERVICE_ACCOUNT_PATH è valorizzato (locale/Docker con
+         volume montato): restituisce il path direttamente, senza modifiche.
+
+      3. Se nessuno dei due è impostato: solleva ValueError con messaggio
+         esplicito su come configurare l'ambiente.
+
+    Il path tmp è cachato a livello di modulo per non riscrivere il file
+    ad ogni chiamata — la decodifica avviene solo alla prima invocazione.
+    """
+    global _GOOGLE_CREDS_TMP_PATH
+
+    settings = get_settings()
+
+    # ── Caso 1: credenziali in base64 (cloud deploy) ─────────────────────────
+    if settings.google_credentials_b64:
+        if _GOOGLE_CREDS_TMP_PATH and os.path.exists(_GOOGLE_CREDS_TMP_PATH):
+            return _GOOGLE_CREDS_TMP_PATH
+
+        try:
+            decoded_bytes = base64.b64decode(settings.google_credentials_b64)
+        except Exception as e:
+            raise ValueError(
+                f"GOOGLE_CREDENTIALS_B64 non è una stringa base64 valida: {e}"
+            ) from e
+
+        # Scrive in /tmp su Linux, in %TEMP% su Windows — gestito da tempfile
+        tmp_dir  = tempfile.gettempdir()
+        tmp_path = os.path.join(tmp_dir, "google_credentials.json")
+        with open(tmp_path, "wb") as f:
+            f.write(decoded_bytes)
+
+        _GOOGLE_CREDS_TMP_PATH = tmp_path
+        return tmp_path
+
+    # ── Caso 2: path locale (Docker volume) ──────────────────────────────────
+    if settings.google_service_account_path:
+        return settings.google_service_account_path
+
+    # ── Caso 3: nessuna credenziale configurata ──────────────────────────────
+    raise ValueError(
+        "Credenziali Google mancanti. Imposta una di queste variabili "
+        "d'ambiente:\n"
+        "  - GOOGLE_CREDENTIALS_B64: contenuto del JSON Service Account "
+        "codificato in base64 (consigliato per deploy cloud come Railway)\n"
+        "  - GOOGLE_SERVICE_ACCOUNT_PATH: path al file JSON Service Account "
+        "(consigliato per esecuzione locale/Docker con volume montato)"
+    )
 
 # testo OpenAi, in caso di fallback uso Groq
 # ha stessa struttura api di OpenAi, quindi posso usare oggetto ChatOpenAI per entrambi

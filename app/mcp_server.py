@@ -15,7 +15,7 @@ import google.auth
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-from app.config import get_settings
+from app.config import get_settings, get_google_credentials_path
 import logging
 
 logger = logging.getLogger(__name__)
@@ -33,13 +33,18 @@ def get_google_service():
 
     Usa Service Account JSON per autenticazione headless — appropriato
     per applicazioni server-side che girano senza interazione utente.
+
+    Il path delle credenziali è risolto da get_google_credentials_path():
+      - in locale/Docker → file montato come volume
+      - su Railway/cloud → file temporaneo materializzato da GOOGLE_CREDENTIALS_B64
     """
-    credentials_path = Path(settings.google_service_account_path)
+    credentials_path = Path(get_google_credentials_path())
 
     if not credentials_path.exists():
         raise FileNotFoundError(
             f"Service Account JSON non trovato: {credentials_path}\n"
-            "Assicurati di avere il file in credentials/google_service_account.json"
+            "Verifica GOOGLE_SERVICE_ACCOUNT_PATH (locale) o "
+            "GOOGLE_CREDENTIALS_B64 (cloud) nelle variabili d'ambiente."
         )
 
     # Carica le credenziali dal file JSON
