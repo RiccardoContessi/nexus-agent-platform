@@ -226,9 +226,15 @@ def show_sidebar():
                 label = f"{conv['title'][:30]}..." if len(conv['title']) > 30 else conv['title']
                 label += f" ({conv['n_messages']} msg)"
 
-                if st.button(label, key=f"conv_{conv['id']}", use_container_width=True):
-                    _load_conversation(conv["id"])
-                    st.rerun()
+                col_open, col_del = st.columns([5, 1])
+                with col_open:
+                    if st.button(label, key=f"conv_{conv['id']}", use_container_width=True):
+                        _load_conversation(conv["id"])
+                        st.rerun()
+                with col_del:
+                    if st.button("🗑️", key=f"del_{conv['id']}", use_container_width=True):
+                        _delete_conversation(conv["id"])
+                        st.rerun()
 
 
 def _load_conversations():
@@ -246,6 +252,27 @@ def _load_conversation(conversation_id: str):
         st.session_state.conversation_id = conversation_id
         st.session_state.messages        = data.get("messages", [])
         st.session_state.pending_event   = None
+
+
+def _delete_conversation(conversation_id: str):
+    """
+    Cancella una conversazione via DELETE /v1/conversations/{id}.
+    Se era quella attiva, resetta la chat corrente.
+    Ricarica la lista conversazioni dopo la cancellazione.
+    """
+    resp = _api_call("delete", f"/v1/conversations/{conversation_id}")
+    if not resp or resp.status_code not in (200, 204):
+        st.error("Errore nella cancellazione della conversazione")
+        return
+
+    # Se la conversazione cancellata era quella attiva, resetta la chat
+    if str(st.session_state.get("conversation_id")) == str(conversation_id):
+        st.session_state.conversation_id = None
+        st.session_state.messages        = []
+        st.session_state.last_agent      = ""
+        st.session_state.pending_event   = None
+
+    _load_conversations()
 
 
 # =============================================================================
