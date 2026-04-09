@@ -124,34 +124,43 @@ async def _generate_title(query: str) -> str:
 
 
 def _extract_new_messages(
-    state_before : list,
+    user_query   : str,
     state_after  : list,
     agente_usato : str,
     tools_usati  : list[str],
 ) -> list[dict]:
     """
-    Estrae i messaggi nuovi confrontando la history prima e dopo l'invocazione.
-    Restituisce solo i messaggi aggiunti durante questa invocazione del Supervisor.
-    """
-    n_before   = len(state_before)
-    new_msgs   = state_after[n_before:]
-    result     = []
+    Costruisce i nuovi messaggi da salvare nel DB:
+      - Il messaggio utente (lo conosciamo già, è la query del request)
+      - L'ultimo AIMessage con content non vuoto nello state (risposta finale)
 
-    for msg in new_msgs:
-        if isinstance(msg, HumanMessage):
-            result.append({
-                "role"        : "human",
-                "content"     : msg.content,
-                "agente_usato": None,
-                "tools_usati" : None,
-            })
-        elif isinstance(msg, AIMessage) and msg.content:
+    Approccio robusto: NON dipende da slicing su len(messages_before).
+    Se summarize_node comprime lo state in RAM (riduce messages alla fine
+    dell'invocazione), lo slicing del vecchio approccio restituirebbe una
+    lista vuota e nessun messaggio verrebbe persistito. Qui invece la query
+    è sempre nota dall'input, e la risposta finale è sempre l'ultimo
+    AIMessage che summarize_node mantiene (il keep window è gli ultimi 4).
+    """
+    result = [{
+        "role"        : "human",
+        "content"     : user_query,
+        "agente_usato": None,
+        "tools_usati" : None,
+    }]
+
+    # Cerca la risposta finale: l'ultimo AIMessage con contenuto testuale
+    # (gli AIMessage intermedi con solo tool_calls hanno content vuoto e
+    # vengono saltati — non sono risposte, ma passi del ciclo ReAct).
+    for msg in reversed(state_after):
+        if isinstance(msg, AIMessage) and msg.content:
             result.append({
                 "role"        : "ai",
                 "content"     : msg.content,
                 "agente_usato": agente_usato,
                 "tools_usati" : tools_usati if tools_usati else None,
             })
+            break
+
     return result
 
 
@@ -283,8 +292,10 @@ async def chat(
     history = await load_from_db(db, conversation_id)
 
     # ── Step 3: costruisce lo state e invoca il Supervisor ────────────────────
-    # Aggiunge il nuovo messaggio dell'utente alla history caricata
-    messages_before = history["messages"].copy()
+    # Aggiunge il nuovo messaggio dell'utente alla history caricata.
+    # Nota: non serve più catturare messages_before — _extract_new_messages
+    # ricostruisce il delta dalla query nota e dall'ultimo AIMessage del result,
+    # quindi è robusto a eventuali compressioni dello state da parte di summarize_node.
     history["messages"].append(HumanMessage(content=request.query))
 
     initial_state = {
@@ -311,7 +322,7 @@ async def chat(
     summary      = result.get("summary", history["summary"])
 
     new_messages = _extract_new_messages(
-        messages_before,
+        request.query,
         result.get("messages", []),
         agente_usato,
         tools_usati,

@@ -224,7 +224,6 @@ def show_sidebar():
         else:
             for conv in conversations:
                 label = f"{conv['title'][:30]}..." if len(conv['title']) > 30 else conv['title']
-                label += f" ({conv['n_messages']} msg)"
 
                 col_open, col_del = st.columns([5, 1])
                 with col_open:
