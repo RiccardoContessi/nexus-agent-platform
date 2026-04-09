@@ -15,6 +15,8 @@
 #   build_calendar_agent() → Google Calendar con HITL obbligatorio
 # =============================================================================
 
+from datetime import datetime
+
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import MemorySaver
@@ -228,7 +230,10 @@ def build_calendar_agent():
       - Utente approva o rifiuta via POST /v1/approve
       - Se approvato: update_state → invoke(None) → tool eseguito → evento creato
     """
-    CALENDAR_SYSTEM = """Sei un assistente per la gestione del calendario aziendale.
+    data_corrente = datetime.now().strftime("%Y-%m-%d")
+    CALENDAR_SYSTEM = f"""Oggi è {data_corrente}. Usa questa data come riferimento per calcolare date relative come 'domani', 'tra 3 giorni', ecc.
+
+Sei un assistente per la gestione del calendario aziendale.
 
 Quando l'utente chiede di creare un evento:
 1. Estrai: titolo, data (YYYY-MM-DD), ora inizio (HH:MM), ora fine (HH:MM)

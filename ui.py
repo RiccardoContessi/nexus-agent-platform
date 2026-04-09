@@ -289,6 +289,10 @@ def show_chat():
     pending = st.session_state.get("pending_event")
     if pending:
         show_pending_approval(pending)
+        # Durante HITL il grafo è sospeso: blocca l'input chat e mostra solo
+        # i bottoni Conferma/Annulla per evitare crash su nuove invocazioni.
+        st.chat_input("Conferma o annulla l'evento per continuare...", disabled=True)
+        return
 
     # ── Input utente ──────────────────────────────────────────────────────────
     if prompt := st.chat_input("Scrivi un messaggio..."):
