@@ -31,6 +31,19 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+# Sentinel restituito dai tool quando nessun brano supera la soglia di
+# rilevanza. Non e' un messaggio per l'utente: e' un segnale per agents.py,
+# che su questo valore rifiuta SENZA invocare l'LLM.
+NESSUN_DOCUMENTO_RILEVANTE = "__NESSUN_DOCUMENTO_RILEVANTE__"
+
+# Testo effettivamente mostrato all'utente in caso di rifiuto.
+MESSAGGIO_RIFIUTO = (
+    "Non ho trovato nei documenti indicizzati alcun passaggio che risponda a "
+    "questa domanda. Non dispongo di una fonte documentale per rispondere e "
+    "non formulo risposte non documentate."
+)
+
+
 embeddings = OpenAIEmbeddings(
     model=settings.embedding_model,
     api_key=settings.openai_api_key,
@@ -80,6 +93,12 @@ def _rerank(query: str, docs: list[Document], top_n: int = 5) -> list[Document]:
 
     FlashrankRerank usa un cross-encoder leggero che valuta la coppia
     (query, documento) invece dei soli vettori — più preciso del solo embedding.
+
+    Lo score del cross-encoder viene PRESERVATO in metadata["rerank_score"].
+    Prima veniva scartato: il reranker sa dire "questo brano non c'entra nulla"
+    e quell'informazione andava persa, così i 5 brani meno peggio finivano
+    all'LLM anche quando nessuno rispondeva alla domanda. È il segnale su cui
+    si fonda il rifiuto in _search_namespaces().
     """
     if not docs:
         return []
@@ -91,20 +110,55 @@ def _rerank(query: str, docs: list[Document], top_n: int = 5) -> list[Document]:
     request = RerankRequest(query=query, passages=passages)
     results = ranker.rerank(request)[:top_n]
 
-    # Ricostruisce i Document preservando i metadata originali
+    # Ricostruisce i Document preservando i metadata originali + lo score
     return [
         Document(
             page_content=r["text"],
-            metadata=docs[r["id"]].metadata,
+            metadata={
+                **docs[r["id"]].metadata,
+                "rerank_score": float(r["score"]),
+            },
         )
         for r in results
     ]
 
 
+def _format_page(page_label, page) -> str | None:
+    """
+    Restituisce il numero di pagina come stringa di interi, o None se non
+    ricostruibile.
+
+    Pinecone restituisce i numerici come float: `page_label` arriva come 11.0 e
+    finirebbe in citazione come "pag. 11.0", che in riunione si legge come
+    sciatteria. La conversione passa da float a int esplicitamente.
+
+    Preferisce `page_label` — il numero STAMPATO sul foglio, quello che il
+    lettore vede aprendo il PDF. Ripiega su `page + 1` (indice PDF 0-based)
+    solo se page_label manca o non è numerico.
+    """
+    for candidate in (page_label, None if page is None else float(page) + 1):
+        if candidate is None:
+            continue
+        try:
+            return str(int(float(candidate)))
+        except (TypeError, ValueError):
+            # page_label non numerico (es. numerazione romana nel front matter):
+            # si prova il fallback invece di propagare la stringa grezza.
+            continue
+    return None
+
+
 def _docs_to_string(docs: list[Document]) -> str:
     """
     Converte una lista di Document in una stringa leggibile dall'LLM.
-    Include source e namespace dai metadata per citabilità.
+
+    L'intestazione porta ESATTAMENTE i campi che possono comparire in una
+    citazione: titolo, pagina, revisione. È l'unica fonte da cui il modello
+    può citare, quindi non deve contenere altro.
+
+    Il `namespace` è deliberatamente assente: è gergo interno ("procedure",
+    "schede_tecniche") e se il modello lo riecheggia finisce sotto gli occhi
+    del cliente. Ciò che non si vuole vedere in output, non si mette in input.
     """
     if not docs:
         return "Nessun documento trovato."
@@ -112,12 +166,19 @@ def _docs_to_string(docs: list[Document]) -> str:
     chunks = []
     for i, doc in enumerate(docs, 1):
         source    = doc.metadata.get("source", "sconosciuta")
-        namespace = doc.metadata.get("namespace", "")
-        topic     = doc.metadata.get("topic", "")
-        header    = f"[Documento {i} | {namespace} | {source}"
-        if topic:
-            header += f" | {topic}"
-        header += "]"
+        revisione = doc.metadata.get("revisione")
+        pagina    = _format_page(
+            doc.metadata.get("page_label"),
+            doc.metadata.get("page"),
+        )
+
+        parti = [f"Documento {i}", str(source)]
+        if pagina:
+            parti.append(f"pag. {pagina}")
+        if revisione:
+            parti.append(str(revisione))
+
+        header = "[" + " | ".join(parti) + "]"
         chunks.append(f"{header}\n{doc.page_content}")
 
     return "\n\n---\n\n".join(chunks)
@@ -160,14 +221,36 @@ def _search_namespaces(query: str, namespaces: list[str], label: str) -> str:
     # Reranking sull'insieme combinato → top 5
     reranked = _rerank(query, all_docs, top_n=5)
 
-    return _docs_to_string(reranked)
+    # Pavimento di rilevanza: i brani sotto soglia non raggiungono l'LLM.
+    soglia    = settings.rerank_score_threshold
+    ammessi   = [d for d in reranked if d.metadata.get("rerank_score", 0.0) >= soglia]
+    scartati  = len(reranked) - len(ammessi)
+
+    if scartati:
+        logger.info(
+            f"[{label}] {scartati}/{len(reranked)} brani scartati sotto soglia {soglia}"
+        )
+
+    # Nessun brano rilevante: si restituisce il sentinel, non i brani migliori
+    # fra quelli irrilevanti. Chi legge questo valore NON deve chiamare l'LLM.
+    if not ammessi:
+        top = reranked[0].metadata.get("rerank_score", 0.0) if reranked else 0.0
+        logger.info(
+            f"[{label}] Nessun brano sopra soglia (top={top:.4f} < {soglia}) → rifiuto"
+        )
+        return NESSUN_DOCUMENTO_RILEVANTE
+
+    return _docs_to_string(ammessi)
 
 
 # =============================================================================
-# TOOL 1 — Documenti contrattuali (capitolati, listini)
+# TOOL 1 — Documenti contrattuali (capitolati)
 # =============================================================================
 
-CONTRATTUALI_NAMESPACES = ["capitolati", "listini"]
+# Solo i namespace che esistono davvero nell'indice: un namespace assente non
+# fa errore su Pinecone, restituisce zero risultati in silenzio — e maschererebbe
+# un refuso in un nome reale.
+CONTRATTUALI_NAMESPACES = ["capitolati"]
 
 
 @tool
@@ -176,17 +259,17 @@ def search_documenti_contrattuali(query: str) -> str:
     Cerca nei documenti contrattuali e commerciali.
     Usa questo tool per domande su: capitolati di fornitura delle catene
     distributive, requisiti contrattuali richiesti dal cliente, obblighi di
-    fornitura, penali, listini prezzi, codici articolo, pezzature e formati.
+    fornitura, penali, specifiche di prodotto imposte dal committente.
     """
     return _search_namespaces(query, CONTRATTUALI_NAMESPACES, "Contrattuali Tool")
 
 
 # =============================================================================
 # TOOL 2 — Documenti tecnici e di sistema
-#          (schede tecniche, procedure HACCP, non conformità)
+#          (schede tecniche, procedure)
 # =============================================================================
 
-TECNICI_NAMESPACES = ["schede_tecniche", "procedure", "non_conformita"]
+TECNICI_NAMESPACES = ["schede_tecniche", "procedure"]
 
 
 @tool
@@ -194,9 +277,8 @@ def search_documenti_tecnici_e_sistema(query: str) -> str:
     """
     Cerca nelle schede tecniche di prodotto e nella documentazione di sistema qualità.
     Usa questo tool per domande su: schede tecniche di prodotto, ingredienti,
-    allergeni, valori nutrizionali, shelf life, conservazione, procedure HACCP,
-    temperature di cella, controlli di processo, verbali di non conformità
-    e relative azioni correttive.
+    allergeni, valori nutrizionali, shelf life, conservazione, procedure
+    operative di lavorazione e sezionamento, temperature, controlli di processo.
     """
     return _search_namespaces(query, TECNICI_NAMESPACES, "Tecnici Tool")
 

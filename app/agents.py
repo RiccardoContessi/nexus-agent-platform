@@ -27,7 +27,12 @@ class AgentState(TypedDict):
     summary : str
 
 from app.config import get_settings, get_llm
-from app.tools import contrattuali_tools, tecnici_tools
+from app.tools import (
+    contrattuali_tools,
+    tecnici_tools,
+    NESSUN_DOCUMENTO_RILEVANTE,
+    MESSAGGIO_RIFIUTO,
+)
 from app.prompts import (
     build_rag_prompt,
     CONTRATTUALI_SYSTEM_PROMPT,
@@ -101,6 +106,14 @@ def _build_document_agent(tools: list, system_prompt: str):
 
         # Estrae il contesto dai ToolMessage precedenti (risultati del retrieval)
         context = _extract_tool_context(messages)
+
+        # RIFIUTO SENZA LLM.
+        # Il retrieval non ha prodotto alcun brano sopra la soglia di rilevanza.
+        # Invocare comunque il modello significherebbe chiedergli di rispondere
+        # senza fonti: e' esattamente la condizione in cui inventa. Si esce qui,
+        # con un messaggio fisso, senza citazione e senza chiamata all'API.
+        if context.strip() == NESSUN_DOCUMENTO_RILEVANTE:
+            return {"messages": [AIMessage(content=MESSAGGIO_RIFIUTO)]}
 
         # System prompt arricchito con il summary della conversazione
         system = _build_system_with_summary(system_prompt, summary)

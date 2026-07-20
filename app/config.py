@@ -31,6 +31,27 @@ class Settings(BaseSettings):
     flashrank_cache_dir         : str  = "~/.flashrank"
     flashrank_model             : str  = "ms-marco-TinyBERT-L-2-v2"
 
+    # Soglia di rilevanza sotto la quale un brano non raggiunge l'LLM.
+    # Se nessun brano la supera, il sistema rifiuta SENZA chiamare l'LLM:
+    # un modello che non riceve contesto e' un modello che puo' inventare.
+    #
+    # CALIBRATA su corpus reale, 10 domande (5 documentate, 5 fuori corpus):
+    #
+    #     documentate    0.9891  0.9934  0.9940  0.9967  0.9991
+    #     fuori corpus   0.0008  0.0135  0.1212  0.4273  0.7419
+    #                                                    ^^^^^^ "prezzi di listino"
+    #
+    # Le due classi sono nettamente separate: gap 0.2472 fra 0.7419 e 0.9891.
+    # 0.90 sta dentro quel vuoto, tarato STRETTO: margine 0.158 sopra la
+    # domanda fuori corpus piu' insidiosa, 0.089 sotto la documentata piu'
+    # debole. La scelta e' deliberatamente asimmetrica — un rifiuto di troppo
+    # e' recuperabile, una risposta inventata no.
+    #
+    # La separazione esiste solo DOPO il chunking a campo delle schede
+    # tecniche (vedi scripts/ingestion.py): sul chunk-blob precedente le due
+    # classi erano interlacciate e NESSUNA soglia le separava.
+    rerank_score_threshold      : float = 0.90
+
     model_config = SettingsConfigDict(
         env_file          = Path(__file__).parent.parent / ".env",
         env_file_encoding = "utf-8",

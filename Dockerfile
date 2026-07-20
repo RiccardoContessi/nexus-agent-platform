@@ -40,9 +40,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /install /usr/local
 
 # Crea utente non-root per sicurezza
-# -r: utente di sistema (no home, no login)
-# -g: crea anche il gruppo appuser
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+# -r: utente di sistema, -g: gruppo appuser
+# -m: la home serve davvero — flashrank cerca il modello in ~/.flashrank
+RUN groupadd -r appuser && useradd -r -m -g appuser appuser
+
+# ── Modello flashrank, scaricato in fase di BUILD ────────────────────────
+# ensure_flashrank_model() rifiuta di scaricarlo a runtime, di proposito: senza
+# rete l'import fallirebbe in modo opaco. Ma allora il modello deve entrare
+# nell'immagine, altrimenti ogni `docker compose build` produce un container
+# che muore all'avvio — che è esattamente ciò che è successo qui.
+# Scaricandolo al build il container parte anche senza rete.
+USER appuser
+RUN python -c "from flashrank import Ranker; \
+    Ranker(model_name='ms-marco-TinyBERT-L-2-v2', cache_dir='/home/appuser/.flashrank')"
+USER root
 
 # Copia il codice dell'applicazione
 COPY app/       ./app/
