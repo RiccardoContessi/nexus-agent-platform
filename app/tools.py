@@ -9,14 +9,13 @@
 # Restituiscono str — LangGraph la wrappa automaticamente in ToolMessage.
 #
 # Tool esposti:
-#   hr_tools       → [search_hr_documents]
-#   ml_tools       → [search_ml_documents]
-#   report_tools   → [generate_report]
-#   calendar_tools → [create_calendar_event]
+#   contrattuali_tools → [search_documenti_contrattuali]
+#   tecnici_tools      → [search_documenti_tecnici_e_sistema]
+#
+# Entrambi interrogano più namespace Pinecone in parallelo con asyncio.gather.
 # =============================================================================
 
 import asyncio
-import json
 import time
 
 from langchain_core.tools import tool
@@ -25,7 +24,7 @@ from langchain_pinecone import PineconeVectorStore
 from langchain_core.documents import Document
 from flashrank import Ranker, RerankRequest
 
-from app.config import get_settings, get_llm
+from app.config import get_settings, get_llm, ensure_flashrank_model
 import logging
 logger = logging.getLogger(__name__)
 
@@ -37,8 +36,18 @@ embeddings = OpenAIEmbeddings(
     api_key=settings.openai_api_key,
 )
 
-# Ranker FlashrankRerank — modello leggero per reranking locale (no API esterne)
-ranker = Ranker()
+# Ranker FlashrankRerank — modello leggero per reranking locale (no API esterne).
+# cache_dir è esplicito: il default della libreria è "/tmp" (→ C:\tmp su Windows).
+# ensure_flashrank_model() solleva RuntimeError se il modello non è già su disco,
+# così l'assenza è un errore leggibile e non un download silenzioso all'import.
+_flashrank_cache_dir = ensure_flashrank_model()
+ranker = Ranker(
+    model_name=settings.flashrank_model,
+    cache_dir=str(_flashrank_cache_dir),
+)
+logger.info(
+    f"[Flashrank] Modello '{settings.flashrank_model}' caricato da {_flashrank_cache_dir}"
+)
 
 
 def _get_vectorstore(namespace: str) -> PineconeVectorStore:
@@ -114,64 +123,40 @@ def _docs_to_string(docs: list[Document]) -> str:
     return "\n\n---\n\n".join(chunks)
 
 
-def _docs_to_string_no_metadata(docs: list[Document]) -> str:
+def _search_namespaces(query: str, namespaces: list[str], label: str) -> str:
     """
-    Variante di _docs_to_string usata SOLO da generate_report.
+    Interroga più namespace Pinecone IN PARALLELO con asyncio.gather,
+    unisce i risultati, li rerankizza e li serializza per l'LLM.
 
-    A differenza di _docs_to_string, NON include alcun metadato (source, path,
-    namespace, topic, nome file) — solo il contenuto testuale dei chunk
-    separato da divisori. Evita che path locali Windows o nomi di file PDF
-    finiscano nella sezione "Fonti" del report finale generato dall'LLM.
+    È il cuore condiviso dei due tool documentali: il pattern di retrieval
+    parallelo è identico, cambiano solo i namespace interrogati.
     """
-    if not docs:
-        return "Nessun documento trovato."
-
-    chunks = [doc.page_content for doc in docs]
-    return "\n\n---\n\n".join(chunks)
-
-
-# =============================================================================
-# TOOL 1 — HR Documents (3 namespace in parallelo)
-# =============================================================================
-
-@tool
-def search_hr_documents(query: str) -> str:
-    """
-    Cerca informazioni nei documenti HR aziendali.
-    Usa questo tool per domande su: ferie, permessi, ROL, congedo parentale,
-    orario di lavoro, smart working, rimborsi spese, benefit aziendali,
-    polizza sanitaria, bonus MBO, contratti di lavoro, TFR, livelli di
-    inquadramento, procedure HR, formazione, salute e sicurezza sul lavoro.
-    """
-    HR_NAMESPACES = ["hr_policy", "hr_faq", "hr_contracts"]
-
-    # Misura il tempo parallelo vs sequenziale
     t_start = time.perf_counter()
 
     async def _parallel_retrieve():
-        """Interroga i 3 namespace in parallelo con asyncio.gather."""
+        """Lancia una similarity_search per namespace, tutte simultanee."""
         tasks = [
             asyncio.to_thread(_retrieve, ns, query, settings.retriever_k)
-            for ns in HR_NAMESPACES
+            for ns in namespaces
         ]
         # gather lancia tutti i task simultaneamente e aspetta che finiscano tutti
-        results = await asyncio.gather(*tasks)
-        return results
+        return await asyncio.gather(*tasks)
 
     # Esegue la coroutine nel thread corrente (i tool sono chiamati in contesti sync)
     results_per_ns = asyncio.run(_parallel_retrieve())
 
     t_parallel = time.perf_counter() - t_start
 
-    # Merge di tutti i risultati dai 3 namespace
+    # Merge di tutti i risultati dai namespace interrogati
     all_docs = []
-    for ns_docs in results_per_ns:   
-        for doc in ns_docs:          
-            all_docs.append(doc)
+    for ns_docs in results_per_ns:
+        all_docs.extend(ns_docs)
 
-    logger.info(f"[HR Tool] Recuperati {len(all_docs)} docs da {len(HR_NAMESPACES)} namespace "
-            f"in {t_parallel:.2f}s (parallelo)")
-    
+    logger.info(
+        f"[{label}] Recuperati {len(all_docs)} docs da {len(namespaces)} namespace "
+        f"in {t_parallel:.2f}s (parallelo)"
+    )
+
     # Reranking sull'insieme combinato → top 5
     reranked = _rerank(query, all_docs, top_n=5)
 
@@ -179,194 +164,46 @@ def search_hr_documents(query: str) -> str:
 
 
 # =============================================================================
-# TOOL 2 — ML Documents
+# TOOL 1 — Documenti contrattuali (capitolati, listini)
 # =============================================================================
+
+CONTRATTUALI_NAMESPACES = ["capitolati", "listini"]
+
 
 @tool
-def search_ml_documents(query: str) -> str:
+def search_documenti_contrattuali(query: str) -> str:
     """
-    Cerca informazioni nei documenti tecnici di Machine Learning.
-    Usa questo tool per domande su: machine learning, algoritmi di classificazione
-    e regressione, reti neurali, deep learning, backpropagation, overfitting,
-    regularizzazione, metriche di valutazione, pipeline ML, LLM, RAG,
-    embedding, transformer, tecniche AI avanzate, framework (PyTorch, scikit-learn,
-    LangChain, LangGraph).
+    Cerca nei documenti contrattuali e commerciali.
+    Usa questo tool per domande su: capitolati di fornitura delle catene
+    distributive, requisiti contrattuali richiesti dal cliente, obblighi di
+    fornitura, penali, listini prezzi, codici articolo, pezzature e formati.
     """
-    t_start = time.perf_counter()
-
-    # Chiamata sincrona Pinecone wrappata per compatibilità
-    docs = _retrieve("ml_docs", query, k=settings.retriever_k)
-
-    t_retrieval = time.perf_counter() - t_start
-    logger.info(f"[ML Tool] Recuperati {len(docs)} docs in {t_retrieval:.2f}s")
-
-    reranked = _rerank(query, docs, top_n=5)
-
-    return _docs_to_string(reranked)
+    return _search_namespaces(query, CONTRATTUALI_NAMESPACES, "Contrattuali Tool")
 
 
 # =============================================================================
-# TOOL 3 — Report Generator
+# TOOL 2 — Documenti tecnici e di sistema
+#          (schede tecniche, procedure HACCP, non conformità)
 # =============================================================================
+
+TECNICI_NAMESPACES = ["schede_tecniche", "procedure", "non_conformita"]
+
 
 @tool
-def generate_report(topic: str, include_hr: bool = True, include_ml: bool = True) -> str:
+def search_documenti_tecnici_e_sistema(query: str) -> str:
     """
-    Genera un report strutturato in Markdown incrociando le knowledge base HR e ML.
-    Usa questo tool per: report aziendali, riassunti strutturati, analisi comparative,
-    documenti che richiedono informazioni da fonti diverse (policy HR + contenuti tecnici ML),
-    sintesi di argomenti complessi in formato professionale con sezioni e conclusioni.
+    Cerca nelle schede tecniche di prodotto e nella documentazione di sistema qualità.
+    Usa questo tool per domande su: schede tecniche di prodotto, ingredienti,
+    allergeni, valori nutrizionali, shelf life, conservazione, procedure HACCP,
+    temperature di cella, controlli di processo, verbali di non conformità
+    e relative azioni correttive.
     """
-    t_start = time.perf_counter()
-
-    # ── 1. RETRIEVAL ─────────────────────────────────────────────────────────
-    K_PER_NS = 2
-    all_docs = []
-
-    try:
-        namespaces = []
-        if include_hr:
-            namespaces.extend(["hr_policy", "hr_faq", "hr_contracts"])
-        if include_ml:
-            namespaces.append("ml_docs")
-
-        if not namespaces:
-            return "Nessun namespace selezionato per il report."
-
-        # Retrieval sequenziale ma con per-namespace try/except: se un namespace
-        # fallisce gli altri proseguono comunque.
-        for ns in namespaces:
-            try:
-                docs = _retrieve(ns, topic, k=K_PER_NS)
-                all_docs.extend(docs)
-            except Exception as e:
-                logger.warning(f"[Report Tool] Retrieval namespace '{ns}' fallito: {e}")
-                continue
-
-        logger.info(
-            f"[Report Tool] Recuperati {len(all_docs)} docs da {len(namespaces)} namespace "
-            f"in {time.perf_counter() - t_start:.2f}s"
-        )
-    except Exception as e:
-        logger.error(f"[Report Tool] Errore durante il retrieval: {e}")
-        return f"Errore durante il recupero dei documenti per il report: {e}"
-
-    if not all_docs:
-        return "Nessun documento trovato per generare il report."
-
-    # ── 2. RERANKING ─────────────────────────────────────────────────────────
-    # Nota: il context viene costruito con _docs_to_string_no_metadata per
-    # evitare che path locali (es. C:\...\faq.pdf) finiscano nel report.
-    try:
-        t_rerank = time.perf_counter()
-        reranked = _rerank(topic, all_docs, top_n=5)
-        context  = _docs_to_string_no_metadata(reranked)
-        logger.info(
-            f"[Report Tool] Rerank di {len(all_docs)} docs → top {len(reranked)} "
-            f"in {time.perf_counter() - t_rerank:.2f}s"
-        )
-    except Exception as e:
-        logger.warning(f"[Report Tool] Rerank fallito, uso docs grezzi: {e}")
-        # Fallback: salta il rerank, usa i primi 5 documenti grezzi (senza metadata)
-        context = _docs_to_string_no_metadata(all_docs[:5])
-
-    # ── 3. GENERAZIONE LLM ───────────────────────────────────────────────────
-    # Wrappato in try/except: in caso di errore o timeout restituisce comunque
-    # una stringa invece di rimanere appeso indefinitamente.
-    prompt = f"""Sei un assistente specializzato nella generazione di report aziendali.
-
-Genera un report professionale e strutturato in Markdown sul seguente argomento: {topic}
-
-Usa ESCLUSIVAMENTE le informazioni nei documenti seguenti:
-
-{context}
-
-Il report deve seguire questa struttura:
-# [Titolo del Report]
-
-## Sommario Esecutivo
-[2-3 righe che riassumono il contenuto]
-
-## [Sezione 1 — primo tema principale]
-[Contenuto dettagliato con bullet point dove appropriato]
-
-## [Sezione 2 — secondo tema principale]
-[Contenuto dettagliato]
-
-## Conclusioni e Raccomandazioni
-[Punti chiave actionable]
-
-Sii completo e preciso. NON includere sezioni "Fonti", "References", "Sources"
-o "Bibliografia". NON mostrare percorsi di file, URL, path locali o nomi di
-file PDF. Non citare i documenti per nome — usa al massimo riferimenti
-generici al dominio (es. "secondo le policy HR")."""
-
-    try:
-        t_llm = time.perf_counter()
-        llm = get_llm(temperature=0)
-        # request_timeout su ChatOpenAI: 25s evita blocchi infiniti del Report Agent
-        response = llm.invoke(prompt, config={"timeout": 25})
-        logger.info(
-            f"[Report Tool] LLM completato in {time.perf_counter() - t_llm:.2f}s "
-            f"(totale: {time.perf_counter() - t_start:.2f}s)"
-        )
-        return response.content if hasattr(response, "content") else str(response)
-    except Exception as e:
-        logger.error(f"[Report Tool] LLM invoke fallito: {e}")
-        # Fallback: restituisce un report minimale costruito dal context grezzo
-        # (già senza metadata grazie a _docs_to_string_no_metadata), così
-        # l'agente termina invece di rimanere appeso. Niente sezione "Fonti".
-        return (
-            f"# Report su: {topic}\n\n"
-            f"## Sommario\n"
-            f"Generazione automatica fallita ({e}). "
-            f"Di seguito i contenuti rilevanti recuperati dalle knowledge base.\n\n"
-            f"## Contenuti rilevanti\n\n{context}"
-        )
-
-
-# =============================================================================
-# TOOL 4 — Calendar Event (HITL — non scrive direttamente)
-# =============================================================================
-
-@tool
-def create_calendar_event(
-    titolo: str,
-    data: str,
-    ora_inizio: str,
-    ora_fine: str,
-    descrizione: str = "",
-) -> str:
-    """
-    Prepara la creazione di un evento sul Google Calendar aziendale.
-    Usa questo tool quando l'utente vuole: aggiungere un evento, creare una riunione,
-    fissare un appuntamento, schedulare una call, o qualsiasi azione che richieda
-    di scrivere sul calendario. Formato data: YYYY-MM-DD. Formato ora: HH:MM.
-    IMPORTANTE: questo tool NON scrive direttamente sul calendario —
-    richiede approvazione esplicita dell'utente prima di procedere.
-    """
-    # NON chiama Google Calendar API.
-    # Restituisce una stringa strutturata JSON che il nodo calendar_node
-    # in supervisor.py intercetta per popolare pending_calendar_event nello State.
-    # Il grafo si è già fermato su interrupt_before=["tools"] prima di arrivare qui.
-    # Questo return viene letto dopo l'approvazione in POST /v1/approve.
-
-    event_details = {
-        "titolo"     : titolo,
-        "data"       : data,
-        "ora_inizio" : ora_inizio,
-        "ora_fine"   : ora_fine,
-        "descrizione": descrizione,
-    }
-
-    return json.dumps(event_details, ensure_ascii=False)
+    return _search_namespaces(query, TECNICI_NAMESPACES, "Tecnici Tool")
 
 
 # =============================================================================
 # ESPOSIZIONE DEI TOOL PER AGENTE
 # =============================================================================
 
-hr_tools       = [search_hr_documents]
-ml_tools       = [search_ml_documents]
-report_tools   = [generate_report]
-calendar_tools = [create_calendar_event]
+contrattuali_tools = [search_documenti_contrattuali]
+tecnici_tools      = [search_documenti_tecnici_e_sistema]

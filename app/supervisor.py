@@ -1,10 +1,11 @@
 # =============================================================================
 # app/supervisor.py — Supervisor e grafo principale
 # =============================================================================
-# Il Supervisor è il grafo master che coordina i quattro sotto-agenti.
+# Il Supervisor è il grafo master che coordina i due sotto-agenti documentali.
 #
 # Flusso:
-#   START → supervisor_node → route_to_agent → (hr|ml|report|calendar)
+#   START → supervisor_node → route_to_agent
+#         → (documenti_contrattuali | documenti_tecnici_e_sistema)
 #         → (summarize_node?) → END
 #
 # Responsabilità:
@@ -16,27 +17,19 @@
 # Decisioni architetturali chiave:
 #   - with_structured_output(RoutingDecision): routing deterministico via Pydantic
 #   - Thread ID composto: ogni sotto-agente ha memoria isolata per utente/conversazione
-#   - Calendar node rileva interrupt e popola pending_calendar_event
 # =============================================================================
 
-import json
 from typing import Annotated, Literal
 from typing_extensions import TypedDict
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.message import add_messages
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 
 from app.config import get_settings, get_llm
 from app.models import RoutingDecision
 from app.prompts import SUPERVISOR_PROMPT
-from app.agents import (
-    build_hr_agent,
-    build_ml_agent,
-    build_report_agent,
-    build_calendar_agent,
-)
+from app.agents import build_contrattuali_agent, build_tecnici_agent
 from app.memory import should_summarize, summarize_node
 import logging
 logger = logging.getLogger(__name__)
@@ -52,23 +45,21 @@ class SupervisorState(TypedDict):
     """
     State condiviso del grafo Supervisor.
 
-    messages:               history completa — add_messages accumula invece di sovrascrivere
-    summary:                riassunto cumulativo della conversazione (da memory.py)
-    routing:                decisione del Supervisor (agente + motivazione + query riformulata)
-    agente_usato:           nome del sotto-agente che ha risposto (per ChatResponse)
-    tools_usati:            lista dei tool chiamati durante la risposta
-    pending_calendar_event: dettagli evento da approvare via HITL (None se non calendario)
-    user_id:                UUID utente — usato per costruire il thread_id dei sotto-agenti
-    conversation_id:        UUID conversazione — idem
+    messages:        history completa — add_messages accumula invece di sovrascrivere
+    summary:         riassunto cumulativo della conversazione (da memory.py)
+    routing:         decisione del Supervisor (agente + motivazione + query riformulata)
+    agente_usato:    nome del sotto-agente che ha risposto (per ChatResponse)
+    tools_usati:     lista dei tool chiamati durante la risposta
+    user_id:         UUID utente — usato per costruire il thread_id dei sotto-agenti
+    conversation_id: UUID conversazione — idem
     """
-    messages               : Annotated[list, add_messages]
-    summary                : str
-    routing                : RoutingDecision | None
-    agente_usato           : str
-    tools_usati            : list[str]
-    pending_calendar_event : dict | None
-    user_id                : str
-    conversation_id        : str
+    messages        : Annotated[list, add_messages]
+    summary         : str
+    routing         : RoutingDecision | None
+    agente_usato    : str
+    tools_usati     : list[str]
+    user_id         : str
+    conversation_id : str
 
 
 # =============================================================================
@@ -116,22 +107,24 @@ def supervisor_node(state: SupervisorState) -> dict:
 # =============================================================================
 
 def route_to_agent(state: SupervisorState) -> Literal[
-    "hr_node", "ml_node", "report_node", "calendar_node"
+    "contrattuali_node", "tecnici_node"
 ]:
     """
     Arco condizionale che legge state["routing"].agente e smista.
 
     LangGraph richiede una funzione separata per gli archi condizionali —
     non può usare direttamente supervisor_node come arco.
+
+    Nessun ramo di default: RoutingDecision.agente è un Literal sulle due
+    rotte, quindi un nome inatteso fallisce già in validazione Pydantic
+    dentro supervisor_node. Un KeyError qui significherebbe che il Literal
+    e questa mappa sono andati fuori sincrono — meglio rumoroso che silenzioso.
     """
-    agente = state["routing"].agente
     mapping = {
-        "hr_agent"      : "hr_node",
-        "ml_agent"      : "ml_node",
-        "report_agent"  : "report_node",
-        "calendar_agent": "calendar_node",
+        "documenti_contrattuali"      : "contrattuali_node",
+        "documenti_tecnici_e_sistema" : "tecnici_node",
     }
-    return mapping[agente]
+    return mapping[state["routing"].agente]
 
 
 # =============================================================================
@@ -140,10 +133,8 @@ def route_to_agent(state: SupervisorState) -> Literal[
 
 # Gli agenti vengono costruiti una volta sola — il Supervisor li riusa
 # Il build avviene dentro build_supervisor() per evitare import circolari
-_hr_agent       = None
-_ml_agent       = None
-_report_agent   = None
-_calendar_agent = None
+_contrattuali_agent = None
+_tecnici_agent      = None
 
 
 def _make_thread_id(state: SupervisorState, agent_name: str) -> str:
@@ -151,11 +142,11 @@ def _make_thread_id(state: SupervisorState, agent_name: str) -> str:
     Costruisce un thread_id univoco per ogni sotto-agente per ogni conversazione.
 
     Formato: {user_id}_{conversation_id}_{agent_name}
-    Es: "uuid-utente_uuid-conv_hr_agent"
+    Es: "uuid-utente_uuid-conv_documenti_contrattuali"
 
     Questo garantisce che ogni sotto-agente mantenga memoria isolata —
-    l'HR Agent di utente A non condivide stato con quello di utente B,
-    e nemmeno con l'HR Agent della stessa conversazione se interrogato due volte.
+    l'agente contrattuale di utente A non condivide stato con quello di
+    utente B, né con lo stesso agente in un'altra conversazione.
     """
     return f"{state['user_id']}_{state['conversation_id']}_{agent_name}"
 
@@ -188,16 +179,24 @@ def _extract_tools_used(agent_result: dict) -> list[str]:
     return tools_used
 
 
-def hr_node(state: SupervisorState) -> dict:
+def _run_document_agent(
+    state      : SupervisorState,
+    agent,
+    agent_name : str,
+    label      : str,
+) -> dict:
     """
-    Invoca l'HR Agent con la query riformulata dal Supervisor.
-    Estrae risposta finale e tool usati.
+    Invoca un sotto-agente documentale con la query riformulata dal Supervisor
+    ed estrae risposta finale e tool usati.
+
+    I due nodi differiscono solo per l'agente invocato e per il nome
+    registrato in agente_usato: la meccanica sta qui una volta sola.
     """
     routing   = state["routing"]
-    thread_id = _make_thread_id(state, "hr_agent")
+    thread_id = _make_thread_id(state, agent_name)
     config    = {"configurable": {"thread_id": thread_id}}
 
-    result = _hr_agent.invoke(
+    result = agent.invoke(
         {"messages": [HumanMessage(content=routing.query_riformulata)],
          "summary" : state.get("summary", "")},
         config=config,
@@ -206,146 +205,27 @@ def hr_node(state: SupervisorState) -> dict:
     risposta   = _extract_final_response(result)
     tools_used = _extract_tools_used(result)
 
-    logger.info(f"[HR Node] Risposta generata | Tool usati: {tools_used}")
+    logger.info(f"[{label}] Risposta generata | Tool usati: {tools_used}")
 
     return {
         "messages"    : [AIMessage(content=risposta)],
-        "agente_usato": "hr_agent",
+        "agente_usato": agent_name,
         "tools_usati" : tools_used,
     }
 
 
-def ml_node(state: SupervisorState) -> dict:
-    """Invoca l'ML Agent."""
-    routing   = state["routing"]
-    thread_id = _make_thread_id(state, "ml_agent")
-    config    = {"configurable": {"thread_id": thread_id}}
-
-    result = _ml_agent.invoke(
-        {"messages": [HumanMessage(content=routing.query_riformulata)],
-         "summary" : state.get("summary", "")},
-        config=config,
+def contrattuali_node(state: SupervisorState) -> dict:
+    """Invoca l'agente sui documenti contrattuali (capitolati, listini)."""
+    return _run_document_agent(
+        state, _contrattuali_agent, "documenti_contrattuali", "Contrattuali Node"
     )
 
-    risposta   = _extract_final_response(result)
-    tools_used = _extract_tools_used(result)
 
-    logger.info(f"[ML Node] Risposta generata | Tool usati: {tools_used}")
-
-    return {
-        "messages"    : [AIMessage(content=risposta)],
-        "agente_usato": "ml_agent",
-        "tools_usati" : tools_used,
-    }
-
-
-def report_node(state: SupervisorState) -> dict:
-    """Invoca il Report Agent."""
-    routing   = state["routing"]
-    thread_id = _make_thread_id(state, "report_agent")
-    config    = {"configurable": {"thread_id": thread_id}}
-
-    result = _report_agent.invoke(
-        {"messages": [HumanMessage(content=routing.query_riformulata)],
-         "summary" : state.get("summary", "")},
-        config=config,
+def tecnici_node(state: SupervisorState) -> dict:
+    """Invoca l'agente su schede tecniche, procedure HACCP e non conformita."""
+    return _run_document_agent(
+        state, _tecnici_agent, "documenti_tecnici_e_sistema", "Tecnici Node"
     )
-
-    risposta   = _extract_final_response(result)
-    tools_used = _extract_tools_used(result)
-
-    logger.info(f"[Report Node] Report generato | Tool usati: {tools_used}")
-
-    return {
-        "messages"    : [AIMessage(content=risposta)],
-        "agente_usato": "report_agent",
-        "tools_usati" : tools_used,
-    }
-
-
-def calendar_node(state: SupervisorState) -> dict:
-    """
-    Invoca il Calendar Agent — gestisce il caso di interrupt HITL.
-
-    Due scenari possibili:
-      A) LLM chiede chiarimenti (es. manca l'ora) → risponde normalmente
-      B) LLM chiama create_calendar_event → grafo si sospende su interrupt_before
-
-    Nel caso B, get_state(config).next non è vuoto — il grafo è sospeso.
-    Il nodo legge i dettagli dell'evento dall'ultimo AIMessage e popola
-    pending_calendar_event nello state del Supervisor.
-    main.py rileverà pending_calendar_event e risponderà con status=pending_approval.
-    """
-    routing   = state["routing"]
-    thread_id = _make_thread_id(state, "calendar_agent")
-    config    = {"configurable": {"thread_id": thread_id}}
-
-    # Invoca il Calendar Agent — si ferma sull'interrupt se decide di creare l'evento
-    _calendar_agent.invoke(
-        {"messages": [HumanMessage(content=routing.query_riformulata)]},
-        config=config,
-    )
-
-    # Controlla se il grafo è sospeso sull'interrupt
-    agent_state = _calendar_agent.get_state(config)
-    is_suspended = bool(agent_state.next)  # next non vuoto = grafo sospeso
-
-    if is_suspended:
-        # Il Calendar Agent vuole chiamare create_calendar_event — aspetta approvazione
-        # Estrae i dettagli dell'evento dall'ultimo AIMessage o ToolCall
-        event_details = _extract_pending_event(agent_state)
-
-        logger.info(f"[Calendar Node] HITL attivato — evento in attesa di approvazione")
-        logger.info(f"[Calendar Node] Dettagli: {event_details}")
-
-        return {
-            "agente_usato"           : "calendar_agent",
-            "tools_usati"            : ["create_calendar_event"],
-            "pending_calendar_event" : event_details,
-            # Nessun AIMessage — main.py risponde con pending_approval
-        }
-    else:
-        # Il Calendar Agent ha risposto normalmente (chiarimenti, info, ecc.)
-        messages   = agent_state.values.get("messages", [])
-        risposta   = _extract_final_response({"messages": messages})
-        tools_used = _extract_tools_used({"messages": messages})
-
-        logger.info(f"[Calendar Node] Risposta diretta (no interrupt)")
-
-        return {
-            "messages"               : [AIMessage(content=risposta)],
-            "agente_usato"           : "calendar_agent",
-            "tools_usati"            : tools_used,
-            "pending_calendar_event" : None,
-        }
-
-
-def _extract_pending_event(agent_state) -> dict:
-    """
-    Estrae i dettagli dell'evento dal tool_call presente nell'ultimo AIMessage
-    del Calendar Agent quando il grafo è sospeso su interrupt_before=["tools"].
-
-    Quando LangGraph si ferma su interrupt_before=["tools"], l'ultimo messaggio
-    nella history è un AIMessage con tool_calls — contiene i parametri che
-    l'LLM aveva preparato per create_calendar_event.
-    """
-    messages = agent_state.values.get("messages", [])
-
-    for msg in reversed(messages):
-        if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls") and msg.tool_calls:
-            for tool_call in msg.tool_calls:
-                if tool_call.get("name") == "create_calendar_event":
-                    args = tool_call.get("args", {})
-                    return {
-                        "titolo"     : args.get("titolo", "Evento senza titolo"),
-                        "data"       : args.get("data", ""),
-                        "ora_inizio" : args.get("ora_inizio", ""),
-                        "ora_fine"   : args.get("ora_fine", ""),
-                        "descrizione": args.get("descrizione", ""),
-                    }
-
-    # Fallback — non dovrebbe succedere se il grafo è sospeso correttamente
-    return {"titolo": "", "data": "", "ora_inizio": "", "ora_fine": "", "descrizione": ""}
 
 
 # =============================================================================
@@ -378,26 +258,22 @@ def build_supervisor():
     Returns:
         Grafo LangGraph compilato pronto per .invoke() e .astream_events()
     """
-    global _hr_agent, _ml_agent, _report_agent, _calendar_agent
+    global _contrattuali_agent, _tecnici_agent
 
     # Inizializza i sotto-agenti una volta sola
     logger.info("[Supervisor] Inizializzazione sotto-agenti...")
-    _hr_agent       = build_hr_agent()
-    _ml_agent       = build_ml_agent()
-    _report_agent   = build_report_agent()
-    _calendar_agent = build_calendar_agent()
+    _contrattuali_agent = build_contrattuali_agent()
+    _tecnici_agent      = build_tecnici_agent()
     logger.info("[Supervisor] Sotto-agenti pronti")
 
     # Costruisce il grafo del Supervisor
     graph = StateGraph(SupervisorState)
 
     # Aggiunge i nodi
-    graph.add_node("supervisor",    supervisor_node)
-    graph.add_node("hr_node",       hr_node)
-    graph.add_node("ml_node",       ml_node)
-    graph.add_node("report_node",   report_node)
-    graph.add_node("calendar_node", calendar_node)
-    graph.add_node("summarize",     summarize_node)
+    graph.add_node("supervisor",        supervisor_node)
+    graph.add_node("contrattuali_node", contrattuali_node)
+    graph.add_node("tecnici_node",      tecnici_node)
+    graph.add_node("summarize",         summarize_node)
 
     # Archi fissi
     graph.add_edge(START, "supervisor")
@@ -406,7 +282,7 @@ def build_supervisor():
     graph.add_conditional_edges("supervisor", route_to_agent)
 
     # Arco post-agente: ogni nodo → summarize o END
-    for node in ["hr_node", "ml_node", "report_node", "calendar_node"]:
+    for node in ["contrattuali_node", "tecnici_node"]:
         graph.add_conditional_edges(node, should_summarize_edge, {
             "summarize": "summarize",
             END        : END,

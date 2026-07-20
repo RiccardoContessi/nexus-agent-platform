@@ -44,10 +44,15 @@ services:
     env_file:
       - .env
       # Il .env deve contenere:
-      # POSTGRES_URL=postgresql+asyncpg://postgres:password123@db:5433/nexus
-      #                                                         ↑
-      #                                              "db" = nome servizio Docker
-      #                                              Docker risolve "db" → IP container
+      # POSTGRES_URL=postgresql+asyncpg://postgres:password123@db:5432/nexus
+      #                                                         ↑    ↑
+      #                              "db" = nome servizio Docker     |
+      #                              Docker risolve "db" → IP container
+      #                                                              |
+      #                              5432 = porta INTERNA al container.
+      #                              La 5433 è solo la porta pubblicata sull'host
+      #                              (mapping "5433:5432"): dall'interno della rete
+      #                              Docker si usa sempre la 5432.
 
     volumes:
       # Monta credentials in sola lettura — non viene copiata nell'immagine

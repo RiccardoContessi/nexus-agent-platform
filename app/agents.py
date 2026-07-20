@@ -1,21 +1,17 @@
 # =============================================================================
-# app/agents.py — Quattro sotto-agenti LangGraph autonomi
+# app/agents.py — Due sotto-agenti documentali LangGraph autonomi
 # =============================================================================
 # Ogni agente è un grafo LangGraph compilato con ciclo ReAct:
 #   START → llm_node → tools_condition → tools → llm_node → ... → END
 #
-# Tutti e tre gli agenti RAG usano build_rag_prompt() — il punto esatto
-# dove la Prompt Repetition viene applicata o disattivata in base al flag
+# Entrambi gli agenti usano build_rag_prompt() — il punto esatto dove la
+# Prompt Repetition viene applicata o disattivata in base al flag
 # settings.use_prompt_repetition. Zero modifiche al codice per l'A/B test.
 #
 # Agenti:
-#   build_hr_agent()       → 3 namespace HR in parallelo
-#   build_ml_agent()       → namespace ml_docs
-#   build_report_agent()   → HR + ML, output Markdown strutturato
-#   build_calendar_agent() → Google Calendar con HITL obbligatorio
+#   build_contrattuali_agent() → namespace capitolati + listini (in parallelo)
+#   build_tecnici_agent()      → schede_tecniche + procedure + non_conformita
 # =============================================================================
-
-from datetime import datetime
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -31,12 +27,11 @@ class AgentState(TypedDict):
     summary : str
 
 from app.config import get_settings, get_llm
-from app.tools import hr_tools, ml_tools, report_tools, calendar_tools
+from app.tools import contrattuali_tools, tecnici_tools
 from app.prompts import (
     build_rag_prompt,
-    HR_SYSTEM_PROMPT,
-    ML_SYSTEM_PROMPT,
-    REPORT_SYSTEM_PROMPT,
+    CONTRATTUALI_SYSTEM_PROMPT,
+    TECNICI_SYSTEM_PROMPT,
 )
 
 settings = get_settings()
@@ -74,20 +69,26 @@ def _build_system_with_summary(base_system: str, summary: str) -> str:
 
 
 # =============================================================================
-# HR AGENT
+# FACTORY — costruisce un agente documentale RAG
 # =============================================================================
 
-def build_hr_agent():
+def _build_document_agent(tools: list, system_prompt: str):
     """
-    Sotto-agente specializzato in documenti HR.
-    Usa search_hr_documents che interroga 3 namespace Pinecone in parallelo.
-    Applica build_rag_prompt() con Prompt Repetition se abilitata.
-    """
-    llm = get_llm(temperature=0).bind_tools(hr_tools)
+    Costruisce un sotto-agente RAG con ciclo ReAct.
 
-    def hr_llm_node(state: dict) -> dict:
+    I due agenti documentali differiscono solo per i tool che possono chiamare
+    e per il system prompt: la meccanica del grafo è identica, quindi vive qui
+    una volta sola.
+
+    Args:
+        tools:         lista dei tool esposti all'agente
+        system_prompt: system prompt specifico del dominio documentale
+    """
+    llm = get_llm(temperature=0).bind_tools(tools)
+
+    def llm_node(state: dict) -> dict:
         """
-        Nodo di generazione dell'HR Agent.
+        Nodo di generazione.
 
         Costruisce il prompt con build_rag_prompt() che applica
         automaticamente la Prompt Repetition in base al flag Settings.
@@ -98,11 +99,11 @@ def build_hr_agent():
         summary  = state.get("summary", "")
         query    = _get_last_human_query(state)
 
-        # Estrae il contesto dai ToolMessage precedenti (risultati di search_hr_documents)
+        # Estrae il contesto dai ToolMessage precedenti (risultati del retrieval)
         context = _extract_tool_context(messages)
 
         # System prompt arricchito con il summary della conversazione
-        system = _build_system_with_summary(HR_SYSTEM_PROMPT, summary)
+        system = _build_system_with_summary(system_prompt, summary)
 
         if context:
             # Abbiamo già i documenti recuperati — costruisce il prompt completo
@@ -111,7 +112,7 @@ def build_hr_agent():
             response = llm.invoke([HumanMessage(content=final_prompt)])
         else:
             # Prima iterazione — nessun documento ancora recuperato
-            # L'LLM decide di chiamare search_hr_documents (ciclo ReAct)
+            # L'LLM decide di chiamare il tool di ricerca (ciclo ReAct)
             system_msg = SystemMessage(content=system)
             response   = llm.invoke([system_msg] + messages)
 
@@ -119,8 +120,8 @@ def build_hr_agent():
 
     # Costruisce il grafo ReAct
     graph = StateGraph(AgentState)
-    graph.add_node("llm",   hr_llm_node)
-    graph.add_node("tools", ToolNode(hr_tools))
+    graph.add_node("llm",   llm_node)
+    graph.add_node("tools", ToolNode(tools))
 
     graph.add_edge(START, "llm")
     graph.add_conditional_edges("llm", tools_condition)
@@ -130,153 +131,25 @@ def build_hr_agent():
 
 
 # =============================================================================
-# ML AGENT
+# I DUE AGENTI DOCUMENTALI
 # =============================================================================
 
-def build_ml_agent():
+def build_contrattuali_agent():
     """
-    Sotto-agente specializzato in documenti Machine Learning.
-    Stesso pattern dell'HR Agent — usa search_ml_documents.
+    Sotto-agente sui documenti contrattuali e commerciali.
+    Usa search_documenti_contrattuali → namespace capitolati + listini,
+    interrogati in parallelo con asyncio.gather.
     """
-    llm = get_llm(temperature=0).bind_tools(ml_tools)
-
-    def ml_llm_node(state: dict) -> dict:
-        messages = state.get("messages", [])
-        summary  = state.get("summary", "")
-        query    = _get_last_human_query(state)
-        context  = _extract_tool_context(messages)
-        system   = _build_system_with_summary(ML_SYSTEM_PROMPT, summary)
-
-        if context:
-            # Documenti recuperati — applica Prompt Repetition
-            final_prompt = build_rag_prompt(query, context, system)
-            response = llm.invoke([HumanMessage(content=final_prompt)])
-        else:
-            system_msg = SystemMessage(content=system)
-            response   = llm.invoke([system_msg] + messages)
-
-        return {"messages": [response]}
-
-    graph = StateGraph(AgentState)
-    graph.add_node("llm",   ml_llm_node)
-    graph.add_node("tools", ToolNode(ml_tools))
-
-    graph.add_edge(START, "llm")
-    graph.add_conditional_edges("llm", tools_condition)
-    graph.add_edge("tools", "llm")
-
-    return graph.compile(checkpointer=MemorySaver())
+    return _build_document_agent(contrattuali_tools, CONTRATTUALI_SYSTEM_PROMPT)
 
 
-# =============================================================================
-# REPORT AGENT
-# =============================================================================
-
-def build_report_agent():
+def build_tecnici_agent():
     """
-    Sotto-agente per report strutturati in Markdown.
-    Usa generate_report che incrocia namespace HR e ML.
-    Output sempre in formato Markdown con titolo, sezioni e conclusioni.
+    Sotto-agente su schede tecniche e documentazione di sistema qualità.
+    Usa search_documenti_tecnici_e_sistema → namespace schede_tecniche,
+    procedure e non_conformita, interrogati in parallelo con asyncio.gather.
     """
-    # Prima iterazione: LLM con tools bound — può chiamare generate_report.
-    llm = get_llm(temperature=0).bind_tools(report_tools)
-    # Seconda iterazione: LLM SENZA tools — impedisce loop ricorsivo del tool
-    # generate_report (la cui description matcha sempre la query "report").
-    # Pattern identico nello spirito a HR/ML, ma necessario qui perché il tool
-    # è "self-fulfilling": il suo output è già la risposta finale.
-    llm_no_tools = get_llm(temperature=0)
-
-    def report_llm_node(state: dict) -> dict:
-        messages = state.get("messages", [])
-        summary  = state.get("summary", "")
-        query    = _get_last_human_query(state)
-        context  = _extract_tool_context(messages)
-        system   = _build_system_with_summary(REPORT_SYSTEM_PROMPT, summary)
-
-        if context:
-            # Documenti recuperati (ToolMessage presente) — costruisce la risposta
-            # finale con build_rag_prompt. Usa llm_no_tools per garantire che
-            # l'LLM produca testo invece di richiamare ancora generate_report.
-            final_prompt = build_rag_prompt(query, context, system)
-            response = llm_no_tools.invoke([HumanMessage(content=final_prompt)])
-        else:
-            # Prima iterazione — nessun report ancora generato.
-            # L'LLM (con tools) decide di chiamare generate_report (ciclo ReAct).
-            system_msg = SystemMessage(content=system)
-            response   = llm.invoke([system_msg] + messages)
-
-        return {"messages": [response]}
-
-    graph = StateGraph(AgentState)
-    graph.add_node("llm",   report_llm_node)
-    graph.add_node("tools", ToolNode(report_tools))
-
-    graph.add_edge(START, "llm")
-    graph.add_conditional_edges("llm", tools_condition)
-    graph.add_edge("tools", "llm")
-
-    return graph.compile(checkpointer=MemorySaver())
-
-
-# =============================================================================
-# CALENDAR AGENT
-# =============================================================================
-
-def build_calendar_agent():
-    """
-    Sotto-agente per la gestione del Google Calendar.
-
-    Due differenze fondamentali rispetto agli agenti RAG:
-      1. NON usa build_rag_prompt() — non fa retrieval, non ha context
-      2. interrupt_before=["tools"] — si ferma SEMPRE prima di chiamare
-         create_calendar_event, aspettando approvazione esplicita via HITL
-
-    Il HITL funziona così:
-      - LLM decide di chiamare create_calendar_event
-      - LangGraph si ferma prima dell'esecuzione (interrupt)
-      - main.py rileva lo stato sospeso → risponde con pending_approval
-      - Utente approva o rifiuta via POST /v1/approve
-      - Se approvato: update_state → invoke(None) → tool eseguito → evento creato
-    """
-    data_corrente = datetime.now().strftime("%Y-%m-%d")
-    CALENDAR_SYSTEM = f"""Oggi è {data_corrente}. Usa questa data come riferimento per calcolare date relative come 'domani', 'tra 3 giorni', ecc.
-
-Sei un assistente per la gestione del calendario aziendale.
-
-Quando l'utente chiede di creare un evento:
-1. Estrai: titolo, data (YYYY-MM-DD), ora inizio (HH:MM), ora fine (HH:MM)
-2. Se mancano informazioni, chiedi SOLO quelle mancanti
-3. Appena hai TUTTI i dati, chiama IMMEDIATAMENTE create_calendar_event
-   senza chiedere ulteriori conferme — la conferma avviene dopo tramite il sistema
-
-Formato data: YYYY-MM-DD | Formato ora: HH:MM"""
-
-    llm = get_llm(temperature=0).bind_tools(calendar_tools)
-
-    def calendar_llm_node(state: dict) -> dict:
-        """
-        Nodo del Calendar Agent.
-        Non usa build_rag_prompt — prompt diretto senza context RAG.
-        """
-        messages   = state.get("messages", [])
-        system_msg = SystemMessage(content=CALENDAR_SYSTEM)
-        response   = llm.invoke([system_msg] + messages)
-        return {"messages": [response]}
-
-    graph = StateGraph(AgentState)
-    graph.add_node("llm",   calendar_llm_node)
-    graph.add_node("tools", ToolNode(calendar_tools))
-
-    graph.add_edge(START, "llm")
-    graph.add_conditional_edges("llm", tools_condition)
-    graph.add_edge("tools", "llm")
-
-    # interrupt_before=["tools"]: si ferma PRIMA di eseguire ToolNode
-    # Garantisce che create_calendar_event non venga mai chiamato senza approvazione
-    return graph.compile(
-        checkpointer=MemorySaver(),
-        interrupt_before=["tools"],
-    )
+    return _build_document_agent(tecnici_tools, TECNICI_SYSTEM_PROMPT)
 
 
 # =============================================================================

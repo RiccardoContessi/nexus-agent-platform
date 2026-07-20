@@ -11,7 +11,6 @@
 #   access_token, refresh_token, user_email
 #   conversation_id, conversations, messages
 #   last_agent, streaming_enabled
-#   pending_event (per HITL calendario)
 # =============================================================================
 
 import json
@@ -77,7 +76,7 @@ def _logout():
     """Resetta la sessione e forza il ritorno al login."""
     for key in ["access_token", "refresh_token", "user_email",
                 "conversation_id", "conversations", "messages",
-                "last_agent", "pending_event"]:
+                "last_agent"]:
         st.session_state.pop(key, None)
     st.rerun()
 
@@ -175,10 +174,8 @@ def show_sidebar():
         last_agent = st.session_state.get("last_agent", "")
         if last_agent:
             agent_emoji = {
-                "hr_agent"      : "👥",
-                "ml_agent"      : "🤖",
-                "report_agent"  : "📊",
-                "calendar_agent": "📅",
+                "documenti_contrattuali"      : "📄",
+                "documenti_tecnici_e_sistema" : "🔬",
             }.get(last_agent, "🔹")
             st.info(f"{agent_emoji} Ultimo agente: **{last_agent}**")
 
@@ -209,7 +206,6 @@ def show_sidebar():
             st.session_state.conversation_id = None
             st.session_state.messages        = []
             st.session_state.last_agent      = ""
-            st.session_state.pending_event   = None
             st.rerun()
 
         st.divider()
@@ -250,7 +246,6 @@ def _load_conversation(conversation_id: str):
         data = resp.json()
         st.session_state.conversation_id = conversation_id
         st.session_state.messages        = data.get("messages", [])
-        st.session_state.pending_event   = None
 
 
 def _delete_conversation(conversation_id: str):
@@ -269,7 +264,6 @@ def _delete_conversation(conversation_id: str):
         st.session_state.conversation_id = None
         st.session_state.messages        = []
         st.session_state.last_agent      = ""
-        st.session_state.pending_event   = None
 
     _load_conversations()
 
@@ -311,15 +305,6 @@ def show_chat():
                         caption += f" | 🔧 {', '.join(tools)}"
                     st.caption(caption)
 
-    # ── Evento calendario in attesa di approvazione ───────────────────────────
-    pending = st.session_state.get("pending_event")
-    if pending:
-        show_pending_approval(pending)
-        # Durante HITL il grafo è sospeso: blocca l'input chat e mostra solo
-        # i bottoni Conferma/Annulla per evitare crash su nuove invocazioni.
-        st.chat_input("Conferma o annulla l'evento per continuare...", disabled=True)
-        return
-
     # ── Input utente ──────────────────────────────────────────────────────────
     if prompt := st.chat_input("Scrivi un messaggio..."):
         # Aggiunge subito il messaggio utente alla history visuale
@@ -353,12 +338,6 @@ def _invoke_standard(prompt: str):
         # Salva conversation_id se era una nuova conversazione
         if "conversation_id" in data:
             st.session_state.conversation_id = data["conversation_id"]
-
-        # Gestisce pending_approval (Calendar Agent HITL)
-        if data.get("status") == "pending_approval":
-            st.session_state.pending_event = data.get("event", {})
-            st.rerun()
-            return
 
         # Risposta normale
         risposta     = data.get("risposta", "")
@@ -449,75 +428,6 @@ def _invoke_streaming(prompt: str):
 
 
 # =============================================================================
-# PENDING APPROVAL — approvazione evento calendario
-# =============================================================================
-
-def show_pending_approval(event: dict):
-    """
-    Mostra i dettagli dell'evento calendario in attesa di approvazione.
-    Bottoni Conferma e Annulla che chiamano POST /v1/approve.
-    """
-    st.divider()
-    st.subheader("📅 Evento in attesa di approvazione")
-
-    with st.container(border=True):
-        st.markdown(f"**📌 Titolo:** {event.get('titolo', 'N/D')}")
-        st.markdown(f"**📆 Data:** {event.get('data', 'N/D')}")
-        st.markdown(f"**🕐 Inizio:** {event.get('ora_inizio', 'N/D')}")
-        st.markdown(f"**🕑 Fine:** {event.get('ora_fine', 'N/D')}")
-        if event.get("descrizione"):
-            st.markdown(f"**📝 Note:** {event.get('descrizione')}")
-
-    col_ok, col_no = st.columns(2)
-
-    with col_ok:
-        if st.button("✅ Conferma evento", use_container_width=True, type="primary"):
-            _send_approval(approved=True)
-
-    with col_no:
-        if st.button("❌ Annulla", use_container_width=True):
-            _send_approval(approved=False)
-
-    st.divider()
-
-
-def _send_approval(approved: bool):
-    """Invia la decisione di approvazione al backend."""
-    conv_id = st.session_state.get("conversation_id")
-    if not conv_id:
-        st.error("ID conversazione mancante")
-        return
-
-    resp = _api_call("post", "/v1/approve", json={
-        "conversation_id": str(conv_id),
-        "approved"       : approved,
-    })
-
-    if not resp or resp.status_code != 200:
-        st.error("Errore nell'invio dell'approvazione")
-        return
-
-    data     = resp.json()
-    message  = data.get("message", "")
-    status   = data.get("status", "")
-
-    # Aggiorna la chat con la risposta
-    st.session_state.messages.append({
-        "role"        : "ai",
-        "content"     : message,
-        "agente_usato": "calendar_agent",
-        "tools_usati" : ["create_calendar_event"] if approved else [],
-    })
-
-    # Pulisce il pending event
-    st.session_state.pending_event = None
-    st.session_state.last_agent    = "calendar_agent"
-
-    _load_conversations()
-    st.rerun()
-
-
-# =============================================================================
 # ENTRY POINT
 # =============================================================================
 
@@ -539,7 +449,6 @@ def main():
         "messages"         : [],
         "last_agent"       : "",
         "streaming_enabled": False,
-        "pending_event"    : None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:

@@ -20,7 +20,6 @@ class User(Base):
     """
     Tabella utenti — credenziali e profilo.
     hashed_password: la password non viene mai salvata in chiaro.
-    google_calendar_id: nullable, serve solo se l'utente usa il Calendar Agent.
     """
     __tablename__ = "users"
 
@@ -30,7 +29,6 @@ class User(Base):
     full_name        : Mapped[str]       = mapped_column(String(255), nullable=False)
     is_active        : Mapped[bool]      = mapped_column(Boolean, default=True)
     created_at       : Mapped[datetime]  = mapped_column(DateTime(timezone=True), server_default=func.now())
-    google_calendar_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     # Relazione 1→N: un utente ha molte conversazioni
     conversations: Mapped[List["Conversation"]] = relationship("Conversation", back_populates="user", cascade="all, delete-orphan")
@@ -61,7 +59,8 @@ class Message(Base):
     """
     Tabella messaggi — ogni singolo turno di conversazione.
     role: "human" (input utente) o "ai" (risposta del sistema).
-    agente_usato: quale sotto-agente ha risposto (hr_agent, ml_agent, ecc.).
+    agente_usato: quale sotto-agente ha risposto
+                  (documenti_contrattuali | documenti_tecnici_e_sistema).
     tools_usati: lista dei tool chiamati durante la risposta, salvata come JSON.
     """
     __tablename__ = "messages"
@@ -129,23 +128,11 @@ class RoutingDecision(BaseModel):
     """
     Output strutturato del Supervisor.
     Usato con with_structured_output(RoutingDecision) — MAI JsonOutputParser.
-    agente: quale sotto-agente invocare.
+
+    agente è un Literal sulle sole due rotte esistenti: se il modello
+    allucina un nome di agente, Pydantic fallisce in validazione invece di
+    lasciar cadere la richiesta silenziosamente dentro il grafo.
     """
-    agente            : Literal["hr_agent", "ml_agent", "report_agent", "calendar_agent"]
+    agente            : Literal["documenti_contrattuali", "documenti_tecnici_e_sistema"]
     motivazione       : str   # perché il supervisor ha scelto questo agente
     query_riformulata : str   # query ottimizzata per il sotto-agente
-
-# --- Calendar HITL ---
-
-class CalendarEventRequest(BaseModel):
-    """Dettagli evento da approvare — restituito in pending_approval"""
-    titolo      : str
-    data        : str   # formato YYYY-MM-DD
-    ora_inizio  : str   # formato HH:MM
-    ora_fine    : str   # formato HH:MM
-    descrizione : str = ""
-
-class ApproveRequest(BaseModel):
-    """Body di POST /v1/approve"""
-    conversation_id : uuid.UUID
-    approved        : bool

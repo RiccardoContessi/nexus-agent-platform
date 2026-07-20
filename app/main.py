@@ -4,7 +4,7 @@
 # Espone tutti gli endpoint REST del sistema multi-agente.
 #
 # Struttura:
-#   - Lifespan: inizializza DB, Supervisor, MCP Server
+#   - Lifespan: inizializza DB e Supervisor
 #   - /auth/*:  register, login, refresh (no JWT richiesto)
 #   - /v1/*:    tutti gli endpoint protetti da JWT
 #   - /health:  health check pubblico
@@ -12,19 +12,16 @@
 # Pattern chiave:
 #   - asyncio.to_thread per chiamate sincrone (Supervisor, Pinecone)
 #   - Depends(get_current_user) su tutti gli endpoint /v1/
-#   - pending_calendar_event nello state → risposta pending_approval
 # =============================================================================
 
 import asyncio
-import threading
 import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
 
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings, get_llm
@@ -33,7 +30,6 @@ from app.models import (
     User, Conversation, Message,
     UserCreate, UserResponse, TokenResponse,
     ChatRequest, ChatResponse,
-    ApproveRequest,
 )
 from app.auth import (
     hash_password, verify_password,
@@ -41,7 +37,6 @@ from app.auth import (
     get_current_user,
 )
 from app.memory import save_to_db, load_from_db
-from app.mcp_server import start_mcp_server, write_event_direct
 from app.supervisor import build_supervisor
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
@@ -67,14 +62,9 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
     print("PostgreSQL — tabelle pronte")
 
-    # 2. Inizializza il Supervisor (costruisce i 4 sotto-agenti)
+    # 2. Inizializza il Supervisor (costruisce i 2 sotto-agenti documentali)
     app.state.supervisor = build_supervisor()
     print("Supervisor — agenti inizializzati")
-
-    # 3. Avvia il MCP Server in un thread daemon separato
-    mcp_thread = threading.Thread(target=start_mcp_server, daemon=True)
-    mcp_thread.start()
-    print("MCP Server — avviato in thread separato")
 
     print(f"Prompt Repetition: {'ABILITATA' if settings.use_prompt_repetition else 'DISABILITATA'}")
     print(f"Database: {settings.postgres_url.split('@')[-1]}")  # stampa solo host/db
@@ -265,8 +255,7 @@ async def chat(
       2. Carica history + summary dal DB
       3. Invoca il Supervisor (in thread separato — è sincrono)
       4. Salva nuovi messaggi e summary nel DB
-      5. Se pending_calendar_event → restituisce pending_approval
-         Altrimenti → restituisce ChatResponse
+      5. Restituisce ChatResponse
     """
     supervisor = req.app.state.supervisor
 
@@ -300,12 +289,11 @@ async def chat(
 
     initial_state = {
         **history,
-        "routing"                : None,
-        "agente_usato"           : "",
-        "tools_usati"            : [],
-        "pending_calendar_event" : None,
-        "user_id"                : str(current_user.id),
-        "conversation_id"        : str(conversation_id),
+        "routing"         : None,
+        "agente_usato"    : "",
+        "tools_usati"     : [],
+        "user_id"         : str(current_user.id),
+        "conversation_id" : str(conversation_id),
     }
 
     # asyncio.to_thread: il Supervisor è sincrono — lo esegue in thread separato
@@ -331,15 +319,6 @@ async def chat(
     await save_to_db(db, conversation_id, new_messages, summary)
 
     # ── Step 5: risposta ──────────────────────────────────────────────────────
-    pending = result.get("pending_calendar_event")
-    if pending:
-        # Il Calendar Agent è sospeso — chiede approvazione all'utente
-        return {
-            "status"         : "pending_approval",
-            "event"          : pending,
-            "conversation_id": str(conversation_id),
-        }
-
     # Estrae la risposta finale dall'ultimo AIMessage
     risposta = ""
     for msg in reversed(result.get("messages", [])):
@@ -394,12 +373,11 @@ async def chat_stream(
 
     initial_state = {
         **history,
-        "routing"                : None,
-        "agente_usato"           : "",
-        "tools_usati"            : [],
-        "pending_calendar_event" : None,
-        "user_id"                : str(current_user.id),
-        "conversation_id"        : str(conversation_id),
+        "routing"         : None,
+        "agente_usato"    : "",
+        "tools_usati"     : [],
+        "user_id"         : str(current_user.id),
+        "conversation_id" : str(conversation_id),
     }
 
     async def event_generator():
@@ -431,109 +409,6 @@ async def chat_stream(
             "Connection"       : "keep-alive",
         },
     )
-
-
-# =============================================================================
-# POST /v1/approve — approvazione HITL calendario
-# =============================================================================
-
-@router.post("/approve")
-async def approve_calendar(
-    request     : ApproveRequest,
-    req         : Request,
-    current_user: User         = Depends(get_current_user),
-    db          : AsyncSession = Depends(get_db),
-):
-    """
-    Approva o rifiuta la creazione di un evento sul calendario.
-
-    Se approved=True:
-      1. update_state sul Calendar Agent (sblocca l'interrupt)
-      2. invoke(None) — riprende il grafo dal punto di sospensione
-      3. Scrive l'evento su Google Calendar via MCP
-      4. Salva il messaggio di conferma nel DB
-
-    Se approved=False:
-      Salva un messaggio di rifiuto e restituisce conferma annullamento.
-    """
-    from app.supervisor import _calendar_agent
-
-    supervisor = req.app.state.supervisor
-
-    # Carica la conversazione per verificare ownership e leggere pending_event
-    conv = await db.get(Conversation, request.conversation_id)
-    if not conv or conv.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Conversazione non trovata")
-
-    # Ricostruisce il thread_id del Calendar Agent per questa conversazione
-    thread_id = f"{current_user.id}_{request.conversation_id}_calendar_agent"
-    config    = {"configurable": {"thread_id": thread_id}}
-
-    if request.approved:
-        # ── Approvazione ──────────────────────────────────────────────────────
-        # Riprende il Calendar Agent dal punto di sospensione
-        # invoke(None) = riprendi senza aggiungere nuovi messaggi
-        calendar_result = await asyncio.to_thread(
-            _calendar_agent.invoke,
-            None,
-            config,
-        )
-
-        # Estrae i dettagli dell'evento dall'ultimo ToolMessage (create_calendar_event)
-        event_details = _extract_event_from_result(calendar_result)
-
-        # Scrive su Google Calendar via MCP
-        try:
-            calendar_result_mcp = await asyncio.to_thread(
-                write_event_direct,
-                event_details,
-            )
-            event_id   = calendar_result_mcp.get("event_id", "")
-            event_link = calendar_result_mcp.get("link", "")
-            risposta   = (
-                f"✅ Evento creato con successo!\n"
-                f"📅 {event_details.get('titolo')} — {event_details.get('data')} "
-                f"{event_details.get('ora_inizio')}-{event_details.get('ora_fine')}\n"
-                f"🔗 {event_link}"
-            )
-        except Exception as e:
-            risposta = f"⚠️ Errore nella creazione dell'evento: {str(e)}"
-
-        # Salva la risposta nel DB
-        await save_to_db(
-            db,
-            request.conversation_id,
-            [{"role": "ai", "content": risposta, "agente_usato": "calendar_agent", "tools_usati": ["create_calendar_event"]}],
-            summary=conv.summary,
-        )
-
-        return {"status": "approved", "message": risposta}
-
-    else:
-        # ── Rifiuto ───────────────────────────────────────────────────────────
-        risposta = "❌ Creazione evento annullata su richiesta dell'utente."
-
-        await save_to_db(
-            db,
-            request.conversation_id,
-            [{"role": "ai", "content": risposta, "agente_usato": "calendar_agent", "tools_usati": []}],
-            summary=conv.summary,
-        )
-
-        return {"status": "rejected", "message": risposta}
-
-
-def _extract_event_from_result(result: dict) -> dict:
-    """Estrae i dettagli dell'evento dal ToolMessage di create_calendar_event."""
-    import json as _json
-    messages = result.get("messages", [])
-    for msg in messages:
-        if isinstance(msg, ToolMessage):
-            try:
-                return _json.loads(msg.content)
-            except Exception:
-                pass
-    return {}
 
 
 # =============================================================================

@@ -1,33 +1,18 @@
-import base64
-import os
-import tempfile
 from functools import lru_cache
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from langchain_openai import ChatOpenAI
-import openai
 
 class Settings(BaseSettings):
     # --- Campi obbligatori ---
     openai_api_key              : str
-    groq_api_key                : str
     pinecone_api_key            : str
     pinecone_index              : str
     postgres_url                : str
     jwt_secret_key              : str
-    google_calendar_id          : str = "primary"
-
-    # --- Credenziali Google: una delle due forme è richiesta ---
-    # Locale/Docker: path al file JSON Service Account montato come volume
-    google_service_account_path : str = ""
-    # Railway/cloud: contenuto JSON Service Account codificato in base64
-    # (i provider cloud non permettono volumi per file segreti)
-    google_credentials_b64      : str = ""
 
     # --- Campi opzionali con default ---
     llm_model                   : str  = "gpt-4o-mini"
-    fallback_model              : str  = "llama-3.1-8b-instant"
-    fallback_base_url           : str  = "https://api.groq.com/openai/v1"
     embedding_model             : str  = "text-embedding-3-small"
     retriever_k                 : int  = 5
     jwt_algorithm               : str  = "HS256"
@@ -37,6 +22,14 @@ class Settings(BaseSettings):
     app_name                    : str  = "Enterprise Agent Platform"
     app_version                 : str  = "1.0.0"
     use_prompt_repetition       : bool = True
+
+    # --- Flashrank (reranking locale) ---
+    # Il default di flashrank è la stringa letterale "/tmp", che su Windows
+    # risolve in C:\tmp — una directory alla radice del disco, esposta a
+    # qualsiasi pulizia. Il modello (~170 MB) va tenuto in un path durevole
+    # fuori dal repo. "~" viene espanso da get_flashrank_cache_dir().
+    flashrank_cache_dir         : str  = "~/.flashrank"
+    flashrank_model             : str  = "ms-marco-TinyBERT-L-2-v2"
 
     model_config = SettingsConfigDict(
         env_file          = Path(__file__).parent.parent / ".env",
@@ -50,88 +43,69 @@ def get_settings() -> Settings:
 
 
 # =============================================================================
-# Google Service Account — risoluzione path multi-ambiente
+# Flashrank — cache del modello di reranking
 # =============================================================================
 
-# Path del file temporaneo materializzato dal contenuto base64.
-# Cache module-level: la decodifica avviene una volta sola per processo,
-# le chiamate successive riusano lo stesso file.
-_GOOGLE_CREDS_TMP_PATH: str | None = None
-
-
-def get_google_credentials_path() -> str:
+def get_flashrank_cache_dir() -> Path:
     """
-    Restituisce il path al JSON Service Account di Google, scegliendo
-    automaticamente la fonte in base all'ambiente:
+    Restituisce il path assoluto della cache flashrank, espandendo "~".
 
-      1. Se GOOGLE_CREDENTIALS_B64 è valorizzato (deploy cloud, es. Railway):
-         decodifica il contenuto da base64 e lo materializza in un file
-         temporaneo (/tmp/google_credentials.json o equivalente OS).
-         Restituisce il path del file temporaneo.
-
-      2. Se GOOGLE_SERVICE_ACCOUNT_PATH è valorizzato (locale/Docker con
-         volume montato): restituisce il path direttamente, senza modifiche.
-
-      3. Se nessuno dei due è impostato: solleva ValueError con messaggio
-         esplicito su come configurare l'ambiente.
-
-    Il path tmp è cachato a livello di modulo per non riscrivere il file
-    ad ogni chiamata — la decodifica avviene solo alla prima invocazione.
+    Non verifica la presenza del modello: quello è compito di
+    ensure_flashrank_model(), che va chiamata prima di costruire il Ranker.
     """
-    global _GOOGLE_CREDS_TMP_PATH
+    return Path(get_settings().flashrank_cache_dir).expanduser().resolve()
 
-    settings = get_settings()
 
-    # ── Caso 1: credenziali in base64 (cloud deploy) ─────────────────────────
-    if settings.google_credentials_b64:
-        if _GOOGLE_CREDS_TMP_PATH and os.path.exists(_GOOGLE_CREDS_TMP_PATH):
-            return _GOOGLE_CREDS_TMP_PATH
+def ensure_flashrank_model() -> Path:
+    """
+    Verifica che il modello di reranking sia già presente su disco e
+    restituisce il path della sua directory.
 
-        try:
-            decoded_bytes = base64.b64decode(settings.google_credentials_b64)
-        except Exception as e:
-            raise ValueError(
-                f"GOOGLE_CREDENTIALS_B64 non è una stringa base64 valida: {e}"
-            ) from e
+    Serve a rendere esplicito un fallimento che altrimenti sarebbe silenzioso:
+    flashrank, se non trova la directory del modello, la scarica al volo
+    (Ranker._prepare_model_dir). In una sala riunioni senza rete quel download
+    fallisce all'import, con un errore che non dice cosa manca.
 
-        # Scrive in /tmp su Linux, in %TEMP% su Windows — gestito da tempfile
-        tmp_dir  = tempfile.gettempdir()
-        tmp_path = os.path.join(tmp_dir, "google_credentials.json")
-        with open(tmp_path, "wb") as f:
-            f.write(decoded_bytes)
+    Solleva RuntimeError con istruzioni di ripristino se il modello è assente.
+    """
+    settings   = get_settings()
+    cache_dir  = get_flashrank_cache_dir()
+    model_dir  = cache_dir / settings.flashrank_model
 
-        _GOOGLE_CREDS_TMP_PATH = tmp_path
-        return tmp_path
+    if not model_dir.is_dir():
+        raise RuntimeError(
+            f"Modello flashrank '{settings.flashrank_model}' non trovato in "
+            f"{model_dir}.\n"
+            f"L'applicazione NON lo scarica automaticamente: senza rete "
+            f"l'import fallirebbe in modo opaco.\n"
+            f"Per ripristinarlo, con rete disponibile:\n"
+            f"  python -c \"from flashrank import Ranker; "
+            f"Ranker(model_name='{settings.flashrank_model}', "
+            f"cache_dir=r'{cache_dir}')\"\n"
+            f"Oppure imposta FLASHRANK_CACHE_DIR su una directory che lo contiene."
+        )
 
-    # ── Caso 2: path locale (Docker volume) ──────────────────────────────────
-    if settings.google_service_account_path:
-        return settings.google_service_account_path
+    return cache_dir
 
-    # ── Caso 3: nessuna credenziale configurata ──────────────────────────────
-    raise ValueError(
-        "Credenziali Google mancanti. Imposta una di queste variabili "
-        "d'ambiente:\n"
-        "  - GOOGLE_CREDENTIALS_B64: contenuto del JSON Service Account "
-        "codificato in base64 (consigliato per deploy cloud come Railway)\n"
-        "  - GOOGLE_SERVICE_ACCOUNT_PATH: path al file JSON Service Account "
-        "(consigliato per esecuzione locale/Docker con volume montato)"
-    )
 
-# testo OpenAi, in caso di fallback uso Groq
-# ha stessa struttura api di OpenAi, quindi posso usare oggetto ChatOpenAI per entrambi
+# =============================================================================
+# LLM
+# =============================================================================
+
 def get_llm(temperature: float = 0) -> ChatOpenAI:
+    """
+    Costruisce il client LLM.
+
+    Nota: qui esisteva un fallback su Groq avvolto in
+    try/except (openai.AuthenticationError, openai.RateLimitError) attorno al
+    costruttore di ChatOpenAI. Non ha mai potuto funzionare: il costruttore non
+    effettua alcuna chiamata di rete, quindi quelle eccezioni non vengono
+    sollevate lì ma a .invoke(). Il ramo except era codice morto.
+    È stato rimosso insieme alla dichiarazione corrispondente nel README.
+    """
     settings = get_settings()
-    try:
-        llm = ChatOpenAI(
-            model=settings.llm_model,
-            api_key=settings.openai_api_key,
-            temperature=temperature,
-        )
-        return llm
-    except (openai.AuthenticationError, openai.RateLimitError):
-        return ChatOpenAI(
-            model=settings.fallback_model,
-            api_key=settings.groq_api_key,
-            base_url=settings.fallback_base_url,
-            temperature=temperature,
-        )
+    return ChatOpenAI(
+        model=settings.llm_model,
+        api_key=settings.openai_api_key,
+        temperature=temperature,
+    )

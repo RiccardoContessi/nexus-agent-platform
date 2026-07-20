@@ -42,7 +42,6 @@ Il progetto implementa la tecnica **Prompt Repetition** (paper 2025) per ridurre
 - **Human-in-the-Loop** obbligatorio per eventi Google Calendar
 - **MCP Server** per integrazione dinamica con Google Calendar via Service Account
 - **Streaming SSE** per risposte token-by-token
-- **Fallback automatico** su Groq (llama-3.1-8b-instant) in caso di errore OpenAI
 - **Docker multi-stage** con utente non-root e PostgreSQL healthcheck
 - **Deploy AWS App Runner** con immagine ECR e RDS PostgreSQL
 
@@ -162,7 +161,6 @@ MCP Server → Google Calendar API → Evento creato ✅
 | Orchestrazione agenti | LangGraph | 0.2.x |
 | Framework API | FastAPI + uvicorn | 0.115.x |
 | LLM primario | OpenAI gpt-4o-mini | — |
-| LLM fallback | Groq llama-3.1-8b-instant | — |
 | Vector DB | Pinecone (index: exerag) | — |
 | Embedding | text-embedding-3-small | 1536 dim |
 | Chunking | SemanticChunker | langchain-experimental |
@@ -533,7 +531,7 @@ enterprise_agent/
 ├── .dockerignore
 ├── README.md
 ├── app/
-│   ├── config.py                 ← Settings pydantic-settings + fallback Groq
+│   ├── config.py                 ← Settings pydantic-settings
 │   ├── database.py               ← PostgreSQL + SQLAlchemy async
 │   ├── models.py                 ← ORM models + Pydantic schemas
 │   ├── auth.py                   ← JWT access+refresh + bcrypt
