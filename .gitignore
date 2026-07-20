@@ -37,3 +37,4 @@ credentials_b64.txt
 *.pfx
 .env*
 !.env.example
+docs/
