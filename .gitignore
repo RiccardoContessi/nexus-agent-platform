@@ -20,3 +20,16 @@ google_service_account.json
 
 *.db
 __pycache__
+
+# stato di sessione OMC (non contenuto di progetto)
+.omc/
+
+# --- segreti: categorie, non istanze ---
+credentials/
+credentials_b64.txt
+*.pem
+*.key
+*.p12
+*.pfx
+.env*
+!.env.example
