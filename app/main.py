@@ -29,8 +29,9 @@ from app.database import async_engine, Base, get_db
 from app.models import (
     User, Conversation, Message,
     UserCreate, UserResponse, TokenResponse,
-    ChatRequest, ChatResponse,
+    ChatRequest, ChatResponse, ChunkTracciato,
 )
+from app.tools import reset_trace, get_trace, set_domanda_utente
 from app.auth import (
     hash_password, verify_password,
     create_access_token, create_refresh_token, decode_token,
@@ -296,6 +297,16 @@ async def chat(
         "conversation_id" : str(conversation_id),
     }
 
+    # Azzera la traccia del retrieval PRIMA dell'invoke: senza questo il
+    # pannello diagnostico mostrerebbe anche i brani della domanda precedente.
+    # Vedi app/tools.py per il limite noto (traccia globale, non concorrente).
+    reset_trace()
+
+    # Registra la domanda VERBATIM: e' su questa che i tool fanno il retrieval,
+    # non sulla riformulazione del Supervisor ne' su quella del sotto-agente.
+    # E' cio' che rende riproducibile il punteggio su cui decide la soglia.
+    set_domanda_utente(request.query)
+
     # asyncio.to_thread: il Supervisor è sincrono — lo esegue in thread separato
     # senza bloccare l'event loop di FastAPI
     result = await asyncio.to_thread(
@@ -303,6 +314,8 @@ async def chat(
         initial_state,
         {"configurable": {"thread_id": str(conversation_id)}},
     )
+
+    traccia = get_trace()
 
     # ── Step 4: salva nel DB ──────────────────────────────────────────────────
     agente_usato = result.get("agente_usato", "")
@@ -331,6 +344,8 @@ async def chat(
         agente_usato   =agente_usato,
         conversation_id=conversation_id,
         tools_usati    =tools_usati,
+        chunks         =[ChunkTracciato(**c) for c in traccia],
+        soglia         =get_settings().rerank_score_threshold,
     )
 
 
@@ -379,6 +394,11 @@ async def chat_stream(
         "user_id"         : str(current_user.id),
         "conversation_id" : str(conversation_id),
     }
+
+    # Come in /chat: il retrieval va fatto sulla domanda verbatim anche qui,
+    # altrimenti lo stesso quesito darebbe punteggi diversi sui due endpoint.
+    reset_trace()
+    set_domanda_utente(request.query)
 
     async def event_generator():
         async for event in supervisor.astream_events(

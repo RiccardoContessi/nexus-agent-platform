@@ -1,465 +1,316 @@
 # =============================================================================
-# ui.py — Streamlit Frontend
+# ui.py — Streamlit, schermata unica per la demo
 # =============================================================================
-# Interfaccia utente per Enterprise Agent Platform.
+# Una sola domanda, una sola risposta, le fonti sotto. Niente altro.
 #
-# Flusso:
-#   1. Se no token → form login/register
-#   2. Se token → layout principale con sidebar e chat
+# Cosa è stato tolto rispetto alla versione precedente, e perché:
+#   - sidebar, lista conversazioni, bottone "nuova conversazione"
+#     → in riunione non si naviga la cronologia, si fa una domanda per volta
+#   - badge dell'agente, toggle streaming, toggle prompt repetition
+#     → sono dettagli di architettura: interessano chi ha scritto il sistema,
+#       non chi lo sta valutando
+#   - emoji ovunque
+#     → il tema è la sicurezza alimentare, non un assistente giocattolo
 #
-# Session state keys:
-#   access_token, refresh_token, user_email
-#   conversation_id, conversations, messages
-#   last_agent, streaming_enabled
+# Cosa resta, e perché:
+#   - il login, perché l'accesso è autenticato e va mostrato che lo è
+#   - un pannello a scomparsa con i brani e i punteggi di rerank, CHIUSO di
+#     default: si apre solo se qualcuno chiede "come fa a saperlo"
+#
+# Dimensioni tarate per proiezione a 1440px: il corpo della risposta è a 26px,
+# le fonti a 19px. Le fonti sono la parte che il cliente deve poter leggere
+# dal fondo della sala — è lì che si vede che il sistema non sta inventando.
 # =============================================================================
 
-import json
+import os
+
 import requests
 import streamlit as st
-import os
+
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 
+# Timeout generoso: la prima query dopo il boot paga l'inizializzazione del
+# reranker e degli agenti. Un timeout stretto la farebbe fallire proprio nel
+# momento peggiore, cioè alla prima domanda della riunione.
+REQUEST_TIMEOUT = 120
+
 
 # =============================================================================
-# HELPERS API
+# STILE
 # =============================================================================
 
-def _headers() -> dict:
-    """Header JWT per ogni chiamata API autenticata."""
-    return {"Authorization": f"Bearer {st.session_state.access_token}"}
+CSS = """
+<style>
+  /* Nasconde la cromatura Streamlit: menu, footer, header, deploy button. */
+  #MainMenu, footer, header, [data-testid="stToolbar"],
+  [data-testid="stDecoration"], [data-testid="stStatusWidget"] {
+      display: none !important;
+  }
+
+  .block-container {
+      max-width: 1100px;
+      padding-top: 3rem;
+      padding-bottom: 4rem;
+  }
+
+  /* ── Input della domanda ─────────────────────────────────────────────── */
+  .stTextInput input {
+      font-size: 24px !important;
+      padding: 0.75em 0.9em !important;
+      line-height: 1.4 !important;
+  }
+
+  /* ── Risposta ────────────────────────────────────────────────────────── */
+  .risposta {
+      font-size: 26px;
+      line-height: 1.55;
+      margin: 2rem 0 0 0;
+      white-space: pre-wrap;
+  }
+
+  /* Il rifiuto è reso ESATTAMENTE come una risposta: stesso colore, stesso
+     corpo, nessun bordo, nessuna icona. Non è un errore del sistema — è il
+     sistema che funziona. Colorarlo di rosso insegnerebbe alla sala a
+     leggerlo come un guasto. L'unica differenza è il corsivo. */
+  .risposta.rifiuto {
+      font-style: italic;
+      opacity: 0.85;
+  }
+
+  /* ── Fonti ───────────────────────────────────────────────────────────── */
+  /* Separate da un filetto sottile, non da un box: devono leggersi come una
+     nota in calce al documento, non come un secondo blocco di contenuto. */
+  .fonti {
+      margin-top: 2.5rem;
+      padding-top: 1.1rem;
+      border-top: 1px solid rgba(128, 128, 128, 0.35);
+      font-size: 19px;
+      line-height: 1.5;
+      opacity: 0.9;
+  }
+  .fonti .etichetta {
+      font-size: 14px;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+      opacity: 0.55;
+      display: block;
+      margin-bottom: 0.4rem;
+  }
+
+  /* ── Pannello diagnostico ────────────────────────────────────────────── */
+  .stExpander { margin-top: 2.5rem; }
+  .chunk {
+      font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.45;
+      padding: 0.5rem 0;
+      border-bottom: 1px dotted rgba(128, 128, 128, 0.3);
+  }
+</style>
+"""
 
 
-def _api_call(method: str, path: str, **kwargs) -> requests.Response | None:
+# =============================================================================
+# API
+# =============================================================================
+
+def _login(email: str, password: str) -> bool:
+    """Autentica e salva i token. /auth/login vuole un form OAuth2, non JSON."""
+    try:
+        resp = requests.post(
+            f"{API_BASE}/auth/login",
+            data={"username": email, "password": password},
+            timeout=30,
+        )
+    except requests.RequestException:
+        return False
+
+    if resp.status_code != 200:
+        return False
+
+    dati = resp.json()
+    st.session_state.access_token = dati["access_token"]
+    return True
+
+
+def _chiedi(domanda: str) -> dict | None:
     """
-    Wrapper per tutte le chiamate API.
-    Gestisce automaticamente il rinnovo del token se scaduto (401).
-    Se il refresh fallisce, resetta la sessione e torna al login.
-    """
-    url      = f"{API_BASE}{path}"
-    response = getattr(requests, method)(url, headers=_headers(), **kwargs)
+    Invia la domanda e restituisce la risposta completa.
 
-    if response.status_code == 401:
-        # Access token scaduto — tenta il rinnovo con il refresh token
-        refreshed = _refresh_token()
-        if refreshed:
-            # Riprova la chiamata con il nuovo access token
-            response = getattr(requests, method)(url, headers=_headers(), **kwargs)
-        else:
-            # Refresh fallito — torna al login
-            _logout()
-            return None
-
-    return response
-
-
-def _refresh_token() -> bool:
-    """
-    Rinnova l'access token usando il refresh token.
-    Restituisce True se il rinnovo ha successo, False altrimenti.
+    conversation_id resta None a ogni giro: ogni domanda è indipendente.
+    In demo è la scelta giusta — una domanda non deve poter essere spiegata
+    dal contesto della precedente, altrimenti non si vede quale documento
+    ha risposto.
     """
     try:
         resp = requests.post(
-            f"{API_BASE}/auth/refresh",
-            params={"refresh_token": st.session_state.refresh_token},
+            f"{API_BASE}/v1/chat",
+            headers={"Authorization": f"Bearer {st.session_state.access_token}"},
+            json={"query": domanda, "conversation_id": None},
+            timeout=REQUEST_TIMEOUT,
         )
-        if resp.status_code == 200:
-            data = resp.json()
-            st.session_state.access_token  = data["access_token"]
-            st.session_state.refresh_token = data["refresh_token"]
-            return True
-    except Exception:
-        pass
-    return False
+    except requests.Timeout:
+        st.session_state.errore = "La richiesta ha superato il tempo massimo."
+        return None
+    except requests.RequestException:
+        st.session_state.errore = "Server non raggiungibile."
+        return None
 
+    if resp.status_code == 401:
+        st.session_state.pop("access_token", None)
+        st.session_state.errore = "Sessione scaduta: accedi di nuovo."
+        return None
 
-def _logout():
-    """Resetta la sessione e forza il ritorno al login."""
-    for key in ["access_token", "refresh_token", "user_email",
-                "conversation_id", "conversations", "messages",
-                "last_agent"]:
-        st.session_state.pop(key, None)
-    st.rerun()
+    if resp.status_code != 200:
+        st.session_state.errore = f"Errore dal server ({resp.status_code})."
+        return None
 
-
-# =============================================================================
-# FORM LOGIN / REGISTER
-# =============================================================================
-
-def show_auth_form():
-    """
-    Mostra il form di autenticazione quando non c'è un token valido.
-    Tabs separati per login e registrazione.
-    """
-    st.title("🤖 Enterprise Agent Platform")
-    st.caption("Accedi per iniziare a chattare con gli agenti AI")
-    st.divider()
-
-    tab_login, tab_register = st.tabs(["Accedi", "Registrati"])
-
-    with tab_login:
-        with st.form("login_form"):
-            email    = st.text_input("Email")
-            password = st.text_input("Password", type="password")
-            submit   = st.form_submit_button("Accedi", use_container_width=True)
-
-        if submit:
-            if not email or not password:
-                st.error("Inserisci email e password")
-                return
-
-            resp = requests.post(
-                f"{API_BASE}/auth/login",
-                data={"username": email, "password": password},  # OAuth2 form
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                st.session_state.access_token  = data["access_token"]
-                st.session_state.refresh_token = data["refresh_token"]
-                st.session_state.user_email    = email
-                st.session_state.messages      = []
-                st.session_state.conversation_id = None
-                st.rerun()
-            else:
-                st.error("Credenziali non valide")
-
-    with tab_register:
-        with st.form("register_form"):
-            full_name = st.text_input("Nome completo")
-            email_r   = st.text_input("Email", key="reg_email")
-            password_r= st.text_input("Password (min 8 caratteri)", type="password", key="reg_pass")
-            submit_r  = st.form_submit_button("Registrati", use_container_width=True)
-
-        if submit_r:
-            if not full_name or not email_r or not password_r:
-                st.error("Compila tutti i campi")
-                return
-            if len(password_r) < 8:
-                st.error("Password troppo corta (min 8 caratteri)")
-                return
-
-            resp = requests.post(f"{API_BASE}/auth/register", json={
-                "email": email_r, "password": password_r, "full_name": full_name
-            })
-            if resp.status_code == 201:
-                st.success("Registrazione completata! Ora accedi.")
-            elif resp.status_code == 409:
-                st.error("Email già registrata")
-            else:
-                st.error("Errore nella registrazione")
+    return resp.json()
 
 
 # =============================================================================
-# SIDEBAR
+# RENDERING
 # =============================================================================
 
-def show_sidebar():
+def _separa_fonte(risposta: str) -> tuple[str, str]:
     """
-    Sidebar con:
-    - Info utente e logout
-    - Toggle streaming e prompt repetition
-    - Lista conversazioni cliccabili
-    - Bottone nuova conversazione
+    Divide il corpo della risposta dalla riga "Fonte: ...".
+
+    Il modello chiude sempre con quella riga (vedi CITAZIONE_RULES in
+    app/prompts.py). Qui viene staccata per poterla rendere sotto il filetto,
+    con un corpo diverso. Se la riga non c'è — un rifiuto non ne ha — la
+    risposta torna intera e le fonti restano vuote.
     """
-    with st.sidebar:
-        st.title("💬 Enterprise Agent")
-        st.caption(f"👤 {st.session_state.get('user_email', '')}")
+    righe = risposta.rstrip().split("\n")
+    for i in range(len(righe) - 1, -1, -1):
+        if righe[i].strip().lower().startswith("fonte:"):
+            corpo = "\n".join(righe[:i]).strip()
+            fonte = righe[i].strip()[len("fonte:"):].strip()
+            return corpo, fonte
+    return risposta.strip(), ""
 
-        # ── Logout ────────────────────────────────────────────────────────────
-        if st.button("🚪 Logout", use_container_width=True):
-            _logout()
 
-        st.divider()
+def _mostra_risposta(dati: dict) -> None:
+    corpo, fonte = _separa_fonte(dati.get("risposta", ""))
 
-        # ── Badge ultimo agente ───────────────────────────────────────────────
-        last_agent = st.session_state.get("last_agent", "")
-        if last_agent:
-            agent_emoji = {
-                "documenti_contrattuali"      : "📄",
-                "documenti_tecnici_e_sistema" : "🔬",
-            }.get(last_agent, "🔹")
-            st.info(f"{agent_emoji} Ultimo agente: **{last_agent}**")
+    # Un rifiuto si riconosce dall'assenza di fonte: senza brani sopra soglia
+    # il sistema non cita nulla. È l'unico segnale necessario e non richiede
+    # di confrontare stringhe con il testo del messaggio di rifiuto.
+    e_rifiuto = not fonte
 
-        st.divider()
+    classe = "risposta rifiuto" if e_rifiuto else "risposta"
+    st.markdown(f'<div class="{classe}">{corpo}</div>', unsafe_allow_html=True)
 
-        # ── Toggle streaming ──────────────────────────────────────────────────
-        st.session_state.streaming_enabled = st.toggle(
-            "⚡ Streaming",
-            value=st.session_state.get("streaming_enabled", False),
-            help="Mostra la risposta token per token in tempo reale",
+    if fonte:
+        st.markdown(
+            '<div class="fonti">'
+            '<span class="etichetta">Fonte</span>'
+            f"{fonte}"
+            "</div>",
+            unsafe_allow_html=True,
         )
 
-        # ── Toggle Prompt Repetition ──────────────────────────────────────────
-        # Nota: il toggle aggiorna solo la visualizzazione locale.
-        # In produzione chiamerebbe PATCH /v1/settings per aggiornare il flag
-        # sul server. Per semplicità mostriamo solo il valore corrente.
-        st.toggle(
-            "🔬 Prompt Repetition",
-            value=True,
-            disabled=True,
-            help="Tecnica attiva server-side (configurabile via .env)",
-        )
-
-        st.divider()
-
-        # ── Nuova conversazione ───────────────────────────────────────────────
-        if st.button("➕ Nuova conversazione", use_container_width=True):
-            st.session_state.conversation_id = None
-            st.session_state.messages        = []
-            st.session_state.last_agent      = ""
-            st.rerun()
-
-        st.divider()
-
-        # ── Lista conversazioni ───────────────────────────────────────────────
-        st.subheader("🗂️ Conversazioni")
-        _load_conversations()
-
-        conversations = st.session_state.get("conversations", [])
-        if not conversations:
-            st.caption("Nessuna conversazione ancora")
-        else:
-            for conv in conversations:
-                label = f"{conv['title'][:30]}..." if len(conv['title']) > 30 else conv['title']
-
-                col_open, col_del = st.columns([5, 1])
-                with col_open:
-                    if st.button(label, key=f"conv_{conv['id']}", use_container_width=True):
-                        _load_conversation(conv["id"])
-                        st.rerun()
-                with col_del:
-                    if st.button("🗑️", key=f"del_{conv['id']}", use_container_width=True):
-                        _delete_conversation(conv["id"])
-                        st.rerun()
+    _mostra_diagnostica(dati)
 
 
-def _load_conversations():
-    """Carica la lista conversazioni dal DB."""
-    resp = _api_call("get", "/v1/conversations")
-    if resp and resp.status_code == 200:
-        st.session_state.conversations = resp.json().get("conversations", [])
-
-
-def _load_conversation(conversation_id: str):
-    """Carica i messaggi di una conversazione esistente."""
-    resp = _api_call("get", f"/v1/conversations/{conversation_id}/messages")
-    if resp and resp.status_code == 200:
-        data = resp.json()
-        st.session_state.conversation_id = conversation_id
-        st.session_state.messages        = data.get("messages", [])
-
-
-def _delete_conversation(conversation_id: str):
+def _mostra_diagnostica(dati: dict) -> None:
     """
-    Cancella una conversazione via DELETE /v1/conversations/{id}.
-    Se era quella attiva, resetta la chat corrente.
-    Ricarica la lista conversazioni dopo la cancellazione.
+    Pannello a scomparsa con i brani recuperati e il loro punteggio.
+
+    Chiuso di default, sempre. Contiene anche i brani SCARTATI: su una domanda
+    rifiutata sono l'unica cosa che spiega il rifiuto, e senza di essi il
+    pannello sarebbe vuoto proprio quando serve.
     """
-    resp = _api_call("delete", f"/v1/conversations/{conversation_id}")
-    if not resp or resp.status_code not in (200, 204):
-        st.error("Errore nella cancellazione della conversazione")
+    chunks = dati.get("chunks") or []
+    if not chunks:
         return
 
-    # Se la conversazione cancellata era quella attiva, resetta la chat
-    if str(st.session_state.get("conversation_id")) == str(conversation_id):
-        st.session_state.conversation_id = None
-        st.session_state.messages        = []
-        st.session_state.last_agent      = ""
+    soglia = dati.get("soglia", 0.0)
+    ammessi = sum(1 for c in chunks if c.get("ammesso"))
 
-    _load_conversations()
+    with st.expander(
+        f"Brani recuperati: {ammessi} sopra soglia su {len(chunks)} "
+        f"(soglia {soglia:.2f})",
+        expanded=False,
+    ):
+        st.caption(f"Agente: {dati.get('agente_usato', '—')}")
+        for c in sorted(chunks, key=lambda x: x.get("score", 0), reverse=True):
+            esito  = "AMMESSO " if c.get("ammesso") else "SCARTATO"
+            pagina = f" · pag. {c['pagina']}" if c.get("pagina") else ""
+            testo  = " ".join(c.get("estratto", "").split())[:220]
+            st.markdown(
+                f'<div class="chunk"><b>{c.get("score", 0):.4f} · {esito}</b> — '
+                f'{c.get("source", "")}{pagina}<br>{testo}</div>',
+                unsafe_allow_html=True,
+            )
 
 
 # =============================================================================
-# CHAT PRINCIPALE
+# SCHERMATE
 # =============================================================================
 
-def show_chat():
-    """Area principale di chat con history e input utente."""
-    st.title("🤖 Enterprise Agent Platform")
+def schermata_login() -> None:
+    st.markdown("### Accesso")
+    with st.form("login"):
+        email    = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        entra    = st.form_submit_button("Accedi", use_container_width=True)
 
-    conv_id = st.session_state.get("conversation_id")
-    if conv_id:
-        st.caption(f"Conversazione: `{str(conv_id)[:8]}...`")
-    else:
-        st.caption("Nuova conversazione")
-
-    st.divider()
-
-    # ── Mostra history ────────────────────────────────────────────────────────
-    messages = st.session_state.get("messages", [])
-    for msg in messages:
-        role    = msg.get("role", "ai")
-        content = msg.get("content", "")
-
-        with st.chat_message("user" if role == "human" else "assistant"):
-            st.markdown(content)
-
-            # Caption con metadati agente e tool (solo per messaggi AI)
-            if role == "ai":
-                agente = msg.get("agente_usato", "")
-                tools  = msg.get("tools_usati") or []
-                if agente or tools:
-                    caption = ""
-                    if agente:
-                        caption += f"🔹 {agente}"
-                    if tools:
-                        caption += f" | 🔧 {', '.join(tools)}"
-                    st.caption(caption)
-
-    # ── Input utente ──────────────────────────────────────────────────────────
-    if prompt := st.chat_input("Scrivi un messaggio..."):
-        # Aggiunge subito il messaggio utente alla history visuale
-        st.session_state.messages.append({"role": "human", "content": prompt})
-
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        # Invoca l'agente con o senza streaming
-        if st.session_state.get("streaming_enabled", False):
-            _invoke_streaming(prompt)
+    if entra:
+        if _login(email, password):
+            st.rerun()
         else:
-            _invoke_standard(prompt)
+            st.error("Credenziali non valide.")
 
 
-def _invoke_standard(prompt: str):
-    """Invoca il Supervisor in modalità standard (risposta completa)."""
-    with st.chat_message("assistant"):
-        with st.spinner("⏳ Elaborazione in corso..."):
-            resp = _api_call("post", "/v1/chat", json={
-                "query"          : prompt,
-                "conversation_id": st.session_state.get("conversation_id"),
-            })
+def schermata_demo() -> None:
+    domanda = st.text_input(
+        "Domanda",
+        key="domanda",
+        placeholder="Fai una domanda sui documenti…",
+        label_visibility="collapsed",
+    )
 
-        if not resp or resp.status_code != 200:
-            st.error("Errore nella comunicazione con il server")
-            return
+    # Streamlit rieseque lo script a ogni interazione. Senza confrontare con
+    # l'ultima domanda servita, la stessa domanda verrebbe rilanciata a ogni
+    # rerun — una chiamata LLM per ogni click sulla pagina.
+    if domanda and domanda != st.session_state.get("ultima_domanda"):
+        st.session_state.ultima_domanda = domanda
+        st.session_state.errore = ""
+        with st.spinner(""):
+            st.session_state.risultato = _chiedi(domanda)
 
-        data = resp.json()
+    if st.session_state.get("errore"):
+        st.warning(st.session_state.errore)
 
-        # Salva conversation_id se era una nuova conversazione
-        if "conversation_id" in data:
-            st.session_state.conversation_id = data["conversation_id"]
-
-        # Risposta normale
-        risposta     = data.get("risposta", "")
-        agente_usato = data.get("agente_usato", "")
-        tools_usati  = data.get("tools_usati", [])
-
-        st.markdown(risposta)
-
-        if agente_usato or tools_usati:
-            caption = ""
-            if agente_usato:
-                caption += f"🔹 {agente_usato}"
-            if tools_usati:
-                caption += f" | 🔧 {', '.join(tools_usati)}"
-            st.caption(caption)
-
-        # Aggiorna session state
-        st.session_state.messages.append({
-            "role"        : "ai",
-            "content"     : risposta,
-            "agente_usato": agente_usato,
-            "tools_usati" : tools_usati,
-        })
-        st.session_state.last_agent = agente_usato
-
-        # Ricarica la lista conversazioni per aggiornare i contatori
-        _load_conversations()
-
-
-def _invoke_streaming(prompt: str):
-    """
-    Invoca il Supervisor in modalità streaming SSE.
-    Aggiorna il placeholder token per token usando requests con stream=True.
-    """
-    with st.chat_message("assistant"):
-        placeholder = st.empty()
-        full_response = ""
-
-        try:
-            with requests.post(
-                f"{API_BASE}/v1/chat/stream",
-                headers=_headers(),
-                json={
-                    "query"          : prompt,
-                    "conversation_id": st.session_state.get("conversation_id"),
-                },
-                stream=True,
-                timeout=120,
-            ) as response:
-
-                if response.status_code == 401:
-                    if _refresh_token():
-                        st.rerun()
-                    else:
-                        _logout()
-                    return
-
-                for line in response.iter_lines():
-                    if line:
-                        line = line.decode("utf-8")
-                        if line.startswith("data: "):
-                            token = line[6:]  # rimuove il prefisso "data: "
-                            if token == "[DONE]":
-                                break
-                            full_response += token
-                            # Aggiorna il placeholder con il testo accumulato
-                            placeholder.markdown(full_response + "▌")
-
-        except requests.exceptions.Timeout:
-            st.warning("Timeout — la risposta ha impiegato troppo tempo")
-            return
-        except Exception as e:
-            st.error(f"Errore streaming: {e}")
-            return
-
-        # Mostra la risposta finale senza il cursore
-        placeholder.markdown(full_response)
-
-        # Aggiorna session state
-        st.session_state.messages.append({
-            "role"        : "ai",
-            "content"     : full_response,
-            "agente_usato": "",   # non disponibile in streaming
-            "tools_usati" : [],
-        })
-
-        _load_conversations()
+    if st.session_state.get("risultato"):
+        _mostra_risposta(st.session_state.risultato)
 
 
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
 
-def main():
+def main() -> None:
     st.set_page_config(
-        page_title ="Enterprise Agent Platform",
-        page_icon  ="🤖",
-        layout     ="wide",
-        initial_sidebar_state="expanded",
+        page_title="Assistente documentale",
+        layout="centered",
+        initial_sidebar_state="collapsed",
     )
+    st.markdown(CSS, unsafe_allow_html=True)
 
-    # Inizializza session state alla prima esecuzione
-    defaults = {
-        "access_token"     : None,
-        "refresh_token"    : None,
-        "user_email"       : None,
-        "conversation_id"  : None,
-        "conversations"    : [],
-        "messages"         : [],
-        "last_agent"       : "",
-        "streaming_enabled": False,
-    }
-    for key, val in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
+    for chiave, valore in {
+        "access_token"   : None,
+        "ultima_domanda" : "",
+        "risultato"      : None,
+        "errore"         : "",
+    }.items():
+        st.session_state.setdefault(chiave, valore)
 
-    # Routing principale: login o app
     if not st.session_state.access_token:
-        show_auth_form()
+        schermata_login()
     else:
-        show_sidebar()
-        show_chat()
+        schermata_demo()
 
 
 if __name__ == "__main__":

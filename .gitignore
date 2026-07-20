@@ -24,6 +24,10 @@ __pycache__
 # stato di sessione OMC (non contenuto di progetto)
 .omc/
 
+# Istruzioni operative per la demo: contengono le credenziali di accesso
+# in chiaro, quindi restano fuori dal repository.
+RUN_DEMO.md
+
 # --- segreti: categorie, non istanze ---
 credentials/
 credentials_b64.txt

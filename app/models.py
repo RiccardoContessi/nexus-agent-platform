@@ -115,12 +115,30 @@ class ChatRequest(BaseModel):
     query           : str
     conversation_id : Optional[uuid.UUID] = None  # None = nuova conversazione
 
+class ChunkTracciato(BaseModel):
+    """
+    Un brano recuperato, col punteggio di rerank e l'esito rispetto alla soglia.
+
+    Compaiono anche i brani SCARTATI (ammesso=False): sono la spiegazione del
+    rifiuto. Un pannello che mostrasse solo gli ammessi, su una domanda
+    rifiutata, sarebbe vuoto e non spiegherebbe nulla.
+    """
+    score    : float
+    ammesso  : bool
+    source   : str
+    pagina   : Optional[str] = None
+    estratto : str = ""
+
 class ChatResponse(BaseModel):
     """Response di POST /v1/chat"""
     risposta        : str
     agente_usato    : str
     conversation_id : uuid.UUID
     tools_usati     : List[str] = []
+    # Diagnostica per il pannello a scomparsa della UI. Non e' contenuto della
+    # risposta: la UI la tiene chiusa di default.
+    chunks          : List[ChunkTracciato] = []
+    soglia          : float = 0.0
 
 # --- Supervisor routing ---
 

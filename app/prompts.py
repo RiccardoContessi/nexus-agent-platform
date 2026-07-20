@@ -38,7 +38,13 @@ settings = get_settings()
 CITAZIONE_RULES = """
 REGOLE DI CITAZIONE — vincolanti.
 
-Chiudi SEMPRE la risposta con la fonte, su una riga a sé.
+Chiudi con la fonte, su una riga a sé, OGNI risposta che riporti un contenuto
+dei documenti.
+
+UNICA eccezione: se stai dichiarando che i brani recuperati NON contengono
+l'informazione richiesta, NON scrivere alcuna riga "Fonte:". Non c'è nulla da
+citare, e una citazione sotto un "non risulta" fa sembrare documentata proprio
+l'affermazione che non lo è.
 
 Copia il titolo, il numero di pagina e la revisione ESATTAMENTE come compaiono
 nell'intestazione del brano, senza abbreviarli e senza riscriverli.

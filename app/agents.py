@@ -39,7 +39,19 @@ from app.prompts import (
     TECNICI_SYSTEM_PROMPT,
 )
 
+import logging
+logger = logging.getLogger(__name__)
+
 settings = get_settings()
+
+
+# Numero massimo di ricerche che un agente puo' fare per una singola domanda.
+# 3 e' scelto sui dati della batteria: ogni domanda che ha ricevuto risposta
+# corretta ha usato UNA sola ricerca. Le iterazioni successive non hanno mai
+# aggiunto informazione — il tool e' deterministico a parita' di query, quindi
+# ricercare due volte la stessa cosa restituisce gli stessi brani. 3 lascia
+# margine a una riformulazione utile e taglia il ciclo patologico.
+MAX_TOOL_ITERATIONS = 3
 
 
 # =============================================================================
@@ -91,6 +103,12 @@ def _build_document_agent(tools: list, system_prompt: str):
     """
     llm = get_llm(temperature=0).bind_tools(tools)
 
+    # LLM SENZA tool, per la sola risposta finale al raggiungimento del tetto.
+    # Non e' una variante di configurazione: e' cio' che rende il tetto
+    # STRUTTURALE invece che una richiesta cortese al modello. Senza tool nello
+    # schema, una quarta ricerca non e' improbabile — e' impossibile.
+    llm_finale = get_llm(temperature=0)
+
     def llm_node(state: dict) -> dict:
         """
         Nodo di generazione.
@@ -104,19 +122,53 @@ def _build_document_agent(tools: list, system_prompt: str):
         summary  = state.get("summary", "")
         query    = _get_last_human_query(state)
 
-        # Estrae il contesto dai ToolMessage precedenti (risultati del retrieval)
-        context = _extract_tool_context(messages)
+        # Risultati delle ricerche gia' effettuate, separati fra utili e a vuoto.
+        risultati = _tool_results(messages)
+        utili     = [r for r in risultati if r.strip() != NESSUN_DOCUMENTO_RILEVANTE]
+        context   = "\n\n---\n\n".join(utili)
+
+        # System prompt arricchito con il summary della conversazione
+        system = _build_system_with_summary(system_prompt, summary)
 
         # RIFIUTO SENZA LLM.
         # Il retrieval non ha prodotto alcun brano sopra la soglia di rilevanza.
         # Invocare comunque il modello significherebbe chiedergli di rispondere
         # senza fonti: e' esattamente la condizione in cui inventa. Si esce qui,
         # con un messaggio fisso, senza citazione e senza chiamata all'API.
-        if context.strip() == NESSUN_DOCUMENTO_RILEVANTE:
+        #
+        # La condizione e' "ci sono state ricerche e NESSUNA ha prodotto nulla",
+        # non "l'unico risultato e' il sentinel". La differenza conta: con due
+        # ricerche a vuoto il contesto concatenato diventava
+        # "__NESSUN_DOCUMENTO_RILEVANTE__\n\n---\n\n__NESSUN_DOCUMENTO_RILEVANTE__",
+        # che non e' uguale al sentinel — il confronto falliva, il rifiuto non
+        # scattava e il sentinel finiva all'LLM come se fosse un documento.
+        if risultati and not utili:
             return {"messages": [AIMessage(content=MESSAGGIO_RIFIUTO)]}
 
-        # System prompt arricchito con il summary della conversazione
-        system = _build_system_with_summary(system_prompt, summary)
+        # TETTO ALLE ITERAZIONI DI RICERCA.
+        # Senza questo il ciclo ReAct non ha un limite superiore: se i brani
+        # recuperati non rispondono alla domanda, il modello richiama il tool,
+        # riceve gli stessi brani e richiama ancora. Misurato in batteria: la
+        # domanda "chi effettua il controllo ufficiale" ha fatto 17 ricerche
+        # identiche in 75.4s. In una demo di tre minuti non e' imprecisione,
+        # e' una schermata bloccata.
+        #
+        # Al tetto NON si cerca piu'. Se qualcosa e' stato recuperato si
+        # risponde da quello, con l'LLM privo di tool; se non c'e' nulla si
+        # rifiuta. Rispondere dal contesto gia' in mano, invece di scartarlo,
+        # evita di trasformare in rifiuto una domanda cui il primo retrieval
+        # aveva gia' risposto: il tetto serve a limitare il tempo, non a
+        # buttare via un recupero riuscito.
+        if len(risultati) >= MAX_TOOL_ITERATIONS:
+            logger.warning(
+                f"[Agent] Tetto di {MAX_TOOL_ITERATIONS} ricerche raggiunto "
+                f"per '{query}' — risposta forzata dal contesto disponibile "
+                f"({len(utili)} risultati utili), nessuna nuova ricerca."
+            )
+            if not utili:
+                return {"messages": [AIMessage(content=MESSAGGIO_RIFIUTO)]}
+            final_prompt = build_rag_prompt(query, context, system)
+            return {"messages": [llm_finale.invoke([HumanMessage(content=final_prompt)])]}
 
         if context:
             # Abbiamo già i documenti recuperati — costruisce il prompt completo
@@ -169,20 +221,19 @@ def build_tecnici_agent():
 # HELPER — estrae contesto dai ToolMessage
 # =============================================================================
 
-def _extract_tool_context(messages: list) -> str:
+def _tool_results(messages: list) -> list[str]:
     """
-    Estrae il contenuto dei ToolMessage dalla history dell'agente.
-    Questi messaggi contengono i risultati dei tool (chunk Pinecone reranked).
-    Vengono usati come 'context' in build_rag_prompt().
+    Restituisce il contenuto di ogni ToolMessage nella history dell'agente,
+    uno per elemento — cioe' il risultato di ogni ricerca gia' effettuata.
 
-    Se non ci sono ToolMessage (prima iterazione del ciclo ReAct),
-    restituisce stringa vuota — l'LLM chiamerà il tool per recuperarli.
+    Restituisce una LISTA e non la stringa concatenata perche' al chiamante
+    servono due cose che la concatenazione distrugge: QUANTE ricerche sono
+    state fatte (per il tetto sulle iterazioni) e QUALI sono andate a vuoto
+    (per distinguere "nessun documento rilevante" da "documenti trovati").
+
+    Lista vuota alla prima iterazione del ciclo ReAct: nessuna ricerca ancora,
+    l'LLM chiamera' il tool per farla.
     """
     from langchain_core.messages import ToolMessage
 
-    tool_contents = []
-    for msg in messages:
-        if isinstance(msg, ToolMessage):
-            tool_contents.append(msg.content)
-
-    return "\n\n---\n\n".join(tool_contents) if tool_contents else ""
+    return [msg.content for msg in messages if isinstance(msg, ToolMessage)]

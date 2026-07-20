@@ -16,6 +16,7 @@
 # =============================================================================
 
 import asyncio
+import threading
 import time
 
 from langchain_core.tools import tool
@@ -42,6 +43,118 @@ MESSAGGIO_RIFIUTO = (
     "questa domanda. Non dispongo di una fonte documentale per rispondere e "
     "non formulo risposte non documentate."
 )
+
+
+# =============================================================================
+# TRACCIA DEL RETRIEVAL — per il pannello "come ha fatto" della UI
+# =============================================================================
+# La UI deve poter mostrare i brani recuperati e il loro punteggio di rerank,
+# inclusi quelli SCARTATI: e' proprio la riga sotto soglia che spiega perche'
+# il sistema ha rifiutato. Senza gli scartati il pannello mostrerebbe una
+# lista vuota e nessuna spiegazione.
+#
+# LIMITE NOTO, deliberato: la traccia e' un GLOBALE, non un thread-local.
+#
+# Un thread-local era il primo tentativo ed e' stato scartato perche' NON
+# FUNZIONA qui: LangGraph esegue il nodo tool su un thread proprio, diverso da
+# quello in cui main.py chiama supervisor.invoke(). La traccia veniva scritta
+# su un thread e letta da un altro, e get_trace() restituiva sempre lista
+# vuota — verificato, chunks=0 in risposta.
+#
+# Conseguenza da conoscere: con DUE richieste realmente concorrenti le due
+# tracce si mescolano e il pannello puo' mostrare i brani della domanda
+# sbagliata. Per una demo con un solo presentatore non e' un problema; per un
+# uso multi-utente questo va sostituito da un canale legato allo state del
+# grafo. La risposta e la citazione NON dipendono da qui: la traccia alimenta
+# solo il pannello diagnostico a scomparsa.
+
+_trace_lock   = threading.Lock()
+_trace_chunks : list[dict] = []
+
+
+# =============================================================================
+# DOMANDA DELL'UTENTE, VERBATIM — registrata per il LOG, non per il retrieval
+# =============================================================================
+# Fra la domanda digitata e il retriever ci sono DUE riscritture generate da un
+# LLM, non una:
+#
+#   1. supervisor_node produce RoutingDecision.query_riformulata, e
+#      _run_document_agent la passa al sotto-agente al posto della domanda
+#      (app/supervisor.py). Il prompt del Supervisor lo chiede esplicitamente:
+#      "Riformula la query per l'agente scelto rendendola piu' specifica".
+#   2. il sotto-agente sceglie poi la stringa da passare al tool.
+#
+# Il retrieval usa la RISCRITTA, non questa. La scelta e' MISURATA, non
+# ereditata: passare la domanda verbatim al retriever e' stato provato e
+# peggiora entrambe le classi. A/B sullo stesso reranker, stessi chunk:
+#
+#     domanda                       verbatim   riscritta
+#     #1  allergeni (formale)         0.7892      0.9992
+#     #18 allergeni (colloquiale)     0.8266      0.9992
+#     #19 "quanto pesa un hamburger"  0.0104      0.5446
+#     #17 "il capitolato ... trasporto" 0.6409    0.9974
+#     #14 penali (FUORI corpus)       0.8731      0.0532   <-- deve rifiutare
+#
+# La riscritta normalizza il lessico colloquiale su quello del documento e
+# ALZA le documentate; sulla domanda fuori corpus ABBASSA il punteggio. Col
+# verbatim le due classi si intrecciano (documentata minima 0.0104, fuori
+# corpus massima 0.8731) e NESSUNA soglia le separa: sotto 0.8731 si ammette
+# una risposta inventata sulle penali, sopra si perdono quattro domande
+# legittime. Con la riscritta il vuoto fra le classi resta e 0.90 ci sta dentro.
+#
+# La domanda verbatim si registra comunque, e finisce nel log accanto alla
+# query effettivamente usata: e' l'unico modo per vedere quanto la riscrittura
+# si allontana da cio' che l'utente ha chiesto, e per accorgersi se un domani
+# ricomincia a divergere in modo dannoso.
+#
+# Stesso limite noto della traccia qui sopra, e per la stessa ragione: e' un
+# globale, non un thread-local, perche' LangGraph esegue il nodo tool su un
+# thread diverso da quello che chiama supervisor.invoke(). Con due richieste
+# realmente concorrenti le domande si mescolerebbero. Per una demo con un solo
+# presentatore non e' un problema; per uso multi-utente va legato allo state.
+
+_domanda_lock    = threading.Lock()
+_domanda_utente : str | None = None
+
+
+def set_domanda_utente(domanda: str) -> None:
+    """Registra la domanda verbatim (solo per il log). Prima di ogni invoke."""
+    global _domanda_utente
+    with _domanda_lock:
+        _domanda_utente = domanda
+
+
+def get_domanda_utente() -> str | None:
+    with _domanda_lock:
+        return _domanda_utente
+
+
+def reset_trace() -> None:
+    """Azzera la traccia. Da chiamare all'inizio di ogni richiesta."""
+    with _trace_lock:
+        _trace_chunks.clear()
+
+
+def get_trace() -> list[dict]:
+    """Restituisce i brani tracciati, ammessi e scartati."""
+    with _trace_lock:
+        return list(_trace_chunks)
+
+
+def _record_trace(docs: list[Document], soglia: float) -> None:
+    """Registra i brani rerankati con punteggio, fonte, pagina ed esito."""
+    with _trace_lock:
+        for d in docs:
+            score = float(d.metadata.get("rerank_score", 0.0))
+            _trace_chunks.append({
+                "score"    : score,
+                "ammesso"  : score >= soglia,
+                "source"   : d.metadata.get("source", "sconosciuta"),
+                "pagina"   : _format_page(
+                    d.metadata.get("page_label"), d.metadata.get("page")
+                ),
+                "estratto" : d.page_content[:400],
+            })
 
 
 embeddings = OpenAIEmbeddings(
@@ -191,6 +304,10 @@ def _search_namespaces(query: str, namespaces: list[str], label: str) -> str:
 
     È il cuore condiviso dei due tool documentali: il pattern di retrieval
     parallelo è identico, cambiano solo i namespace interrogati.
+
+    `query` è la stringa riformulata che l'agente ha scelto di passare al tool.
+    È deliberatamente questa e non la domanda verbatim dell'utente: vedi il
+    blocco misurato su set_domanda_utente() in cima al file.
     """
     t_start = time.perf_counter()
 
@@ -213,8 +330,14 @@ def _search_namespaces(query: str, namespaces: list[str], label: str) -> str:
     for ns_docs in results_per_ns:
         all_docs.extend(ns_docs)
 
+    # Si loggano ENTRAMBE le stringhe, e non e' ridondante: `query` e' cio' su
+    # cui si e' cercato davvero (la riformulazione), `domanda` e' cio' che
+    # l'utente ha digitato. Sono i due estremi della riscrittura, ed e' la loro
+    # distanza a spiegare un punteggio inatteso. Senza questa coppia nel log
+    # l'A/B che ha deciso quale delle due usare non sarebbe stato misurabile.
     logger.info(
-        f"[{label}] Recuperati {len(all_docs)} docs da {len(namespaces)} namespace "
+        f"[{label}] query='{query}' | domanda='{get_domanda_utente()}' | "
+        f"recuperati {len(all_docs)} docs da {len(namespaces)} namespace "
         f"in {t_parallel:.2f}s (parallelo)"
     )
 
@@ -225,6 +348,10 @@ def _search_namespaces(query: str, namespaces: list[str], label: str) -> str:
     soglia    = settings.rerank_score_threshold
     ammessi   = [d for d in reranked if d.metadata.get("rerank_score", 0.0) >= soglia]
     scartati  = len(reranked) - len(ammessi)
+
+    # Traccia TUTTI i brani, ammessi e scartati: il pannello della UI deve
+    # poter mostrare la riga sotto soglia che ha causato il rifiuto.
+    _record_trace(reranked, soglia)
 
     if scartati:
         logger.info(
